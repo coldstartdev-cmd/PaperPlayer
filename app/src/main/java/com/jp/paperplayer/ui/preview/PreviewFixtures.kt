@@ -3,7 +3,6 @@ package com.jp.paperplayer.ui.preview
 import android.net.Uri
 import com.jp.paperplayer.model.data.LrcTrack
 import com.jp.paperplayer.model.data.LyricLine
-import com.jp.paperplayer.model.data.MusicBrainzMatch
 import com.jp.paperplayer.model.data.Song
 import com.jp.paperplayer.model.ui.EditorLine
 import com.jp.paperplayer.model.ui.PlayerState
@@ -54,11 +53,6 @@ internal object PreviewFixtures {
     val lrcTracks = listOf(
         LrcTrack(1, "Midnight City", "M83", "Hurry Up, We're Dreaming", 245, "[00:00.00]Waiting in a car", "Waiting in a car"),
         LrcTrack(2, "Midnight City (Remix)", "M83", "Remixes", 250, null, "Waiting in a car"),
-    )
-
-    val musicBrainzMatches = listOf(
-        MusicBrainzMatch("mb-1", "artist-1", "release-1", "Midnight City", "M83", "Hurry Up, We're Dreaming", "2011", "1"),
-        MusicBrainzMatch("mb-2", "artist-1", "release-2", "Midnight City (Live)", "M83", "Live in Paris", "2013", "4"),
     )
 
     val tagEditorState = TagEditorState(
