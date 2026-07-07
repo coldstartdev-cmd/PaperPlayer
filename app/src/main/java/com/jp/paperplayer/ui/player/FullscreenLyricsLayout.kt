@@ -299,7 +299,7 @@ fun FullscreenLyricsLayout(
 
 @Preview(showBackground = true, name = "With lyrics")
 @Composable
-private fun FullscreenLyricsLayoutPreview() {
+internal fun FullscreenLyricsLayoutPreview() {
     PaperPlayerTheme {
         FullscreenLyricsLayout(
             state = PreviewFixtures.playerState,

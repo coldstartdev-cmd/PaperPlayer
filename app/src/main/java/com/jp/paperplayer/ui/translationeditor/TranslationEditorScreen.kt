@@ -265,7 +265,7 @@ private fun TranslationEditorContent(
 
 @Preview(showBackground = true)
 @Composable
-private fun TranslationEditorContentPreview() {
+internal fun TranslationEditorContentPreview() {
     PaperPlayerTheme {
         TranslationEditorContent(
             state = PreviewFixtures.translationEditorState,

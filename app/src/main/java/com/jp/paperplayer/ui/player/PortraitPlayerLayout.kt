@@ -296,7 +296,7 @@ fun PortraitPlayerLayout(
 
 @Preview(showBackground = true, name = "With lyrics")
 @Composable
-private fun PortraitPlayerLayoutPreview() {
+internal fun PortraitPlayerLayoutPreview() {
     PaperPlayerTheme {
         PortraitPlayerLayout(
             state = PreviewFixtures.playerState,

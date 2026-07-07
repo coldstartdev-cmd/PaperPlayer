@@ -11,6 +11,22 @@ A local music player for Android focused on synced lyrics — with built-in supp
 - Background playback with media notification controls
 - Album art display
 
+## Screens
+
+| Library | Player | Fullscreen lyrics |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/songList.png" width="250" alt="Song list"> | <img src="docs/screenshots/player.png" width="250" alt="Player with synced lyrics"> | <img src="docs/screenshots/fullscreenLyrics.png" width="250" alt="Fullscreen lyrics"> |
+
+| Lyrics editor | Translation editor | Tag editor |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/lyricsEditor.png" width="250" alt="Lyrics sync editor"> | <img src="docs/screenshots/translationEditor.png" width="250" alt="Translation editor"> | <img src="docs/screenshots/tagEditor.png" width="250" alt="Tag editor"> |
+
+| Queue | Play stats | Settings |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/queue.png" width="250" alt="Queue"> | <img src="docs/screenshots/playStats.png" width="250" alt="Play stats"> | <img src="docs/screenshots/settings.png" width="250" alt="Settings"> |
+
+Previews are rendered from Compose `@Preview` fixtures by the [Screenshots workflow](.github/workflows/screenshots.yml) (`./gradlew updateDebugScreenshotTest`), not captured from a device.
+
 ## Tech Stack
 
 - Kotlin + Jetpack Compose

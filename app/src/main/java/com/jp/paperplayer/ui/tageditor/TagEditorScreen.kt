@@ -336,7 +336,7 @@ private fun TagEditorContent(
 
 @Preview(showBackground = true)
 @Composable
-private fun TagEditorContentPreview() {
+internal fun TagEditorContentPreview() {
     PaperPlayerTheme {
         TagEditorContent(
             state = PreviewFixtures.tagEditorState,

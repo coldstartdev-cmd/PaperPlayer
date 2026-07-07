@@ -98,7 +98,7 @@ private fun PlayStatsContent(
 
 @Preview(showBackground = true)
 @Composable
-private fun PlayStatsContentPreview() {
+internal fun PlayStatsContentPreview() {
     PaperPlayerTheme {
         PlayStatsContent(
             sortedSongs = PreviewFixtures.songs.sortedByDescending { PreviewFixtures.playCounts[it.id] ?: 0 },

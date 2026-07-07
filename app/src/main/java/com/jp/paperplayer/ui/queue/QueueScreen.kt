@@ -194,7 +194,7 @@ private fun QueueRow(
 
 @Preview(showBackground = true, widthDp = 360)
 @Composable
-private fun QueueContentPreview() {
+internal fun QueueContentPreview() {
     PaperPlayerTheme {
         QueueContent(
             queue = PreviewFixtures.songs,
