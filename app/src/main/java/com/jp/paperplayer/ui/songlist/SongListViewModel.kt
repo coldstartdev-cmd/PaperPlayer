@@ -1,9 +1,9 @@
-package com.jp.paperplayer.viewmodel
+package com.jp.paperplayer.ui.songlist
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.jp.paperplayer.data.Song
+import com.jp.paperplayer.model.data.Song
 import com.jp.paperplayer.scanner.MusicScanner
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow

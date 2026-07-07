@@ -1,6 +1,7 @@
 package com.jp.paperplayer.lyrics
 
 import android.util.Log
+import com.jp.paperplayer.model.data.LrcTrack
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -15,26 +16,60 @@ object LrcLibClient {
     private const val TAG = "LrcLibClient"
     private const val BASE = "https://lrclib.net/api"
 
-    data class Track(
-        val id: Int,
-        val trackName: String,
-        val artistName: String,
-        val albumName: String,
-        val duration: Int,          // seconds
-        val syncedLyrics: String?,
-        val plainLyrics: String?,
-    )
+    // ── Exact-signature lookup ───────────────────────────────────────────────────
+
+    /**
+     * Looks up a track by title + duration, internal database only (no external-source
+     * fallback, so it responds quickly). Returns null on a 404 ("not found") or any error.
+     */
+    fun getCached(trackName: String, durationSec: Int): LrcTrack? {
+        return getBySignature("$BASE/get-cached", trackName, durationSec)
+    }
+
+    /**
+     * Looks up a track by title + duration. If not already in LRCLib's database, this
+     * attempts to fetch it from external sources first, so it can be significantly slower
+     * than [getCached]. Returns null on a 404 ("not found") or any error.
+     */
+    fun get(trackName: String, durationSec: Int): LrcTrack? {
+        return getBySignature("$BASE/get", trackName, durationSec)
+    }
+
+    private fun getBySignature(
+        endpoint: String,
+        trackName: String,
+        durationSec: Int,
+    ): LrcTrack? {
+        return try {
+            val url = "$endpoint?track_name=${enc(trackName)}&duration=$durationSec"
+            val body = get(url) ?: return null
+            parseTrack(JSONObject(body))
+        } catch (e: Exception) {
+            Log.w(TAG, "Signature lookup failed for \"$trackName\": ${e.message}")
+            null
+        }
+    }
 
     // ── Search ────────────────────────────────────────────────────────────────
 
-    fun search(query: String): List<Track> {
+    /**
+     * Keyword search by track name, optionally narrowed by artist/album. Returns up to 20 matches.
+     */
+    fun search(trackName: String, artistName: String? = null, albumName: String? = null): List<LrcTrack> {
+        val params = buildList {
+            if (trackName.isNotBlank()) add("track_name=${enc(trackName)}")
+            if (!artistName.isNullOrBlank()) add("artist_name=${enc(artistName)}")
+            if (!albumName.isNullOrBlank()) add("album_name=${enc(albumName)}")
+        }
+        if (params.isEmpty()) return emptyList()
+
         return try {
-            val url = "$BASE/search?q=${enc(query)}"
+            val url = "$BASE/search?" + params.joinToString("&")
             val body = get(url) ?: return emptyList()
             val arr = JSONArray(body)
             (0 until arr.length()).mapNotNull { parseTrack(arr.getJSONObject(it)) }
         } catch (e: Exception) {
-            Log.w(TAG, "Search failed for \"$query\": ${e.message}")
+            Log.w(TAG, "Search failed for $params: ${e.message}")
             emptyList()
         }
     }
@@ -147,16 +182,24 @@ object LrcLibClient {
         }
     }
 
-    private fun parseTrack(json: JSONObject): Track? {
+    // org.json's optString() returns the literal string "null" for a key whose JSON value is
+    // null (rather than absent) — LRCLib returns explicit `"syncedLyrics": null` for plain-only
+    // tracks, so without this check every result would incorrectly look "synced".
+    private fun optNullableString(json: JSONObject, key: String): String? {
+        if (json.isNull(key)) return null
+        return json.optString(key).takeIf { it.isNotBlank() }
+    }
+
+    private fun parseTrack(json: JSONObject): LrcTrack? {
         return try {
-            Track(
+            LrcTrack(
                 id           = json.getInt("id"),
                 trackName    = json.optString("trackName"),
                 artistName   = json.optString("artistName"),
                 albumName    = json.optString("albumName"),
                 duration     = json.optDouble("duration", 0.0).toInt(),
-                syncedLyrics = json.optString("syncedLyrics").takeIf { it.isNotBlank() },
-                plainLyrics  = json.optString("plainLyrics").takeIf { it.isNotBlank() },
+                syncedLyrics = optNullableString(json, "syncedLyrics"),
+                plainLyrics  = optNullableString(json, "plainLyrics"),
             )
         } catch (e: Exception) {
             null

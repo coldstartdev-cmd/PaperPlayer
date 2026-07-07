@@ -1,4 +1,4 @@
-package com.jp.paperplayer.data
+package com.jp.paperplayer.model.data
 
 import android.net.Uri
 
@@ -10,5 +10,6 @@ data class Song(
     val uri: Uri,
     val filePath: String,
     val duration: Long,
-    val albumArtUri: Uri?
+    val albumArtUri: Uri?,
+    val year: Int = 0,
 )

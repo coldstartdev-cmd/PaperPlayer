@@ -3,6 +3,7 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!-- Storage: READ_MEDIA_AUDIO for API 33+, READ_EXTERNAL_STORAGE for API 24-32 -->
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />

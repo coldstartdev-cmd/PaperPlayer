@@ -64,6 +64,7 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.jaudiotagger)
     implementation(libs.mlkit.translate)
+    implementation(libs.mlkit.language.id)
     implementation(libs.kotlinx.coroutines.play.services)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

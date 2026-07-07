@@ -1,7 +1,7 @@
 package com.jp.paperplayer.lyrics
 
 import android.util.Log
-import com.jp.paperplayer.data.LyricLine
+import com.jp.paperplayer.model.data.LyricLine
 import org.jaudiotagger.audio.AudioFileIO
 import org.jaudiotagger.tag.FieldKey
 import java.io.File

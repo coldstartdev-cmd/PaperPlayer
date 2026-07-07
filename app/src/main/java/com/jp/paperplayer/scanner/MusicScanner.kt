@@ -4,7 +4,7 @@ import android.content.ContentUris
 import android.content.Context
 import android.net.Uri
 import android.provider.MediaStore
-import com.jp.paperplayer.data.Song
+import com.jp.paperplayer.model.data.Song
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -21,6 +21,7 @@ class MusicScanner(private val context: Context) {
             MediaStore.Audio.Media.DATA,
             MediaStore.Audio.Media.DURATION,
             MediaStore.Audio.Media.ALBUM_ID,
+            MediaStore.Audio.Media.YEAR,
         )
 
         context.contentResolver.query(
@@ -37,6 +38,7 @@ class MusicScanner(private val context: Context) {
             val dataCol     = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
             val durationCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
             val albumIdCol  = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM_ID)
+            val yearCol     = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.YEAR)
 
             while (cursor.moveToNext()) {
                 val id      = cursor.getLong(idCol)
@@ -59,6 +61,7 @@ class MusicScanner(private val context: Context) {
                     filePath    = cursor.getString(dataCol) ?: "",
                     duration    = cursor.getLong(durationCol),
                     albumArtUri = albumArtUri,
+                    year        = cursor.getInt(yearCol),
                 )
             }
         }

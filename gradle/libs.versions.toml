@@ -13,6 +13,7 @@ navigationCompose = "2.8.9"
 coil = "3.1.0"
 jaudiotagger = "3.0.1"
 mlkitTranslate = "17.0.3"
+mlkitLanguageId = "17.0.6"
 coroutinesPlayServices = "1.10.2"
 
 [libraries]
@@ -40,6 +41,7 @@ androidx-navigation-compose = { group = "androidx.navigation", name = "navigatio
 coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
 jaudiotagger = { group = "net.jthink", name = "jaudiotagger", version.ref = "jaudiotagger" }
 mlkit-translate = { group = "com.google.mlkit", name = "translate", version.ref = "mlkitTranslate" }
+mlkit-language-id = { group = "com.google.mlkit", name = "language-id", version.ref = "mlkitLanguageId" }
 kotlinx-coroutines-play-services = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-play-services", version.ref = "coroutinesPlayServices" }
 
 [plugins]

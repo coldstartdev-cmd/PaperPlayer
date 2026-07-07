@@ -1,4 +1,4 @@
-package com.jp.paperplayer.data
+package com.jp.paperplayer.model.data
 
 data class LyricLine(
     val timeMs: Long,
