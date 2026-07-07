@@ -114,7 +114,7 @@ private fun ShuffleStrategyRow(
 
 @Preview(showBackground = true)
 @Composable
-private fun SettingsContentPreview() {
+internal fun SettingsContentPreview() {
     PaperPlayerTheme {
         SettingsContent(
             shuffleStrategy = ShuffleStrategy.SMART,

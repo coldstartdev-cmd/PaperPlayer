@@ -260,7 +260,7 @@ private fun SongListContent(
 
 @Preview(showBackground = true)
 @Composable
-private fun SongListContentPreview() {
+internal fun SongListContentPreview() {
     PaperPlayerTheme {
         SongListContent(
             songs = PreviewFixtures.songs,

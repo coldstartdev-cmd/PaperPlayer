@@ -463,7 +463,7 @@ fun SyncingPhase(
 
 @Preview(showBackground = true)
 @Composable
-private fun SyncingPhasePreview() {
+internal fun SyncingPhasePreview() {
     PaperPlayerTheme {
         SyncingPhase(
             editorState = LyricsEditorState(lines = PreviewFixtures.editorLines, currentIndex = 2),
