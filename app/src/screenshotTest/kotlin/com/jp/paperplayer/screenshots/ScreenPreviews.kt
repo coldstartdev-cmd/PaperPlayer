@@ -4,6 +4,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.tooling.preview.Preview
 import com.android.tools.screenshot.PreviewTest
 import com.jp.paperplayer.ui.lyricseditor.SyncingPhasePreview
+import com.jp.paperplayer.ui.party.PartyHostPreview
 import com.jp.paperplayer.ui.player.FullscreenLyricsLayoutPreview
 import com.jp.paperplayer.ui.player.PortraitPlayerLayoutPreview
 import com.jp.paperplayer.ui.playstats.PlayStatsContentPreview
@@ -63,3 +64,8 @@ fun playStats() = PlayStatsContentPreview()
 @Preview(showBackground = true, widthDp = WIDTH, heightDp = HEIGHT)
 @Composable
 fun settings() = SettingsContentPreview()
+
+@PreviewTest
+@Preview(showBackground = true, widthDp = WIDTH, heightDp = HEIGHT)
+@Composable
+fun party() = PartyHostPreview()
