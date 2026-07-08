@@ -317,8 +317,15 @@ class PartyHostEngine(
      */
     private fun scheduleHostPlay(atHostElapsedMs: Long, clearPreparing: Boolean = false) {
         scope.launch {
-            val wait = atHostElapsedMs - SystemClock.elapsedRealtime()
-            if (wait > 150) delay(wait - 100)
+            // Tick the countdown down to the last ~150ms, then hand over to the
+            // precise start below.
+            while (true) {
+                val remaining = atHostElapsedMs - SystemClock.elapsedRealtime()
+                if (remaining <= 150) break
+                update { it.copy(startsInMs = remaining) }
+                delay(minOf(remaining - 120, 100L))
+            }
+            update { it.copy(startsInMs = null) }
             withContext(Dispatchers.Main) {
                 // Burn the last few milliseconds for an on-the-dot start.
                 @Suppress("ControlFlowWithEmptyBody")

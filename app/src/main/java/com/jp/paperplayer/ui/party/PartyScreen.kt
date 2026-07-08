@@ -231,6 +231,9 @@ private fun ColumnScope.HostView(state: PartyUiState, onEndParty: () -> Unit) {
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(vertical = 8.dp),
     )
+    state.startsInMs?.let { remaining ->
+        StartCountdown(remainingMs = remaining)
+    }
 
     Text(
         text = if (state.members.isEmpty()) "No guests yet" else "${state.members.size} guest${if (state.members.size == 1) "" else "s"}",
@@ -319,6 +322,10 @@ private fun GuestView(state: PartyUiState, onLeave: () -> Unit) {
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        state.startsInMs?.let { remaining ->
+            Spacer(Modifier.height(12.dp))
+            StartCountdown(remainingMs = remaining)
+        }
         var showDebug by remember { mutableStateOf(false) }
         TextButton(onClick = { showDebug = !showDebug }) {
             Text(if (showDebug) "Hide sync details" else "Show sync details")
@@ -398,6 +405,20 @@ private fun DebugRow(label: String, value: String) {
 }
 
 private fun formatDebugSeconds(ms: Long): String = "%d.%01ds".format(ms / 1000, (ms % 1000) / 100)
+
+@Composable
+private fun StartCountdown(remainingMs: Long) {
+    Surface(
+        color = MaterialTheme.colorScheme.primaryContainer,
+        shape = MaterialTheme.shapes.large,
+    ) {
+        Text(
+            text = "Starting in ${(remainingMs + 999) / 1000}s",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+        )
+    }
+}
 
 @Composable
 private fun SyncQualityChip(quality: SyncQuality, rttMs: Long?) {

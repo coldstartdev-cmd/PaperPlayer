@@ -39,6 +39,8 @@ data class PartyUiState(
     /** "Title — Artist" of the track the host is sharing (guest role only). */
     val nowPlaying: String? = null,
     val isDownloading: Boolean = false,
+    /** Remaining time until the scheduled playback start, while a countdown runs. */
+    val startsInMs: Long? = null,
     val syncDebug: PartySyncDebug = PartySyncDebug(),
     val error: String? = null,
 )

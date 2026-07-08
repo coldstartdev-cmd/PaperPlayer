@@ -191,7 +191,11 @@ class PartyGuestEngine(
         pendingStartJob?.cancel()
         driftJob?.cancel()
         update {
-            it.copy(isDownloading = true, nowPlaying = "${prepare.title} — ${prepare.artist}")
+            it.copy(
+                isDownloading = true,
+                nowPlaying = "${prepare.title} — ${prepare.artist}",
+                startsInMs = null,
+            )
         }
         scope.launch {
             try {
@@ -224,6 +228,7 @@ class PartyGuestEngine(
     private fun onPause(pause: PartyMessage.Pause) {
         pendingStartJob?.cancel()
         driftJob?.cancel()
+        update { it.copy(startsInMs = null) }
         scope.launch(Dispatchers.Main) {
             val c = controller ?: return@launch
             c.setPlaybackParameters(PlaybackParameters.DEFAULT)
@@ -248,8 +253,15 @@ class PartyGuestEngine(
         pendingStartJob = scope.launch {
             val offset = clockOffsetMs ?: 0L
             val localTarget = atHostElapsedMs - offset
-            val wait = localTarget - SystemClock.elapsedRealtime()
-            if (wait > 150) delay(wait - 100)
+            // Tick the countdown down to the last ~150ms, then hand over to the
+            // precise start below.
+            while (true) {
+                val remaining = localTarget - SystemClock.elapsedRealtime()
+                if (remaining <= 150) break
+                update { it.copy(startsInMs = remaining) }
+                delay(minOf(remaining - 120, 100L))
+            }
+            update { it.copy(startsInMs = null) }
             withContext(Dispatchers.Main) {
                 val c = controller ?: return@withContext
                 c.setPlaybackParameters(PlaybackParameters.DEFAULT)
@@ -426,7 +438,7 @@ class PartyGuestEngine(
         scope.launch(Dispatchers.Main) { controller?.pause() }
         update {
             if (it.role == PartyRole.GUEST) {
-                it.copy(error = "Lost connection to the party", isDownloading = false)
+                it.copy(error = "Lost connection to the party", isDownloading = false, startsInMs = null)
             } else {
                 it.copy(isJoining = false)
             }
