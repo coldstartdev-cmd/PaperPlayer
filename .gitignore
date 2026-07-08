@@ -17,3 +17,6 @@ local.properties
 # Signing keystores — never commit
 *.jks
 *.keystore
+
+# Kotlin compiler session files
+.kotlin/
