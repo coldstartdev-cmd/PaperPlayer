@@ -96,7 +96,11 @@ class PartyHostEngine(
             if (preparing || !hasGuests()) return
             val position = controller?.currentPosition ?: 0L
             if (playWhenReady) {
-                broadcastAsync(PartyMessage.Resume(position, SystemClock.elapsedRealtime() + RESUME_LEAD_MS))
+                // Hold the host for a moment and start everyone at the same instant.
+                val at = SystemClock.elapsedRealtime() + RESUME_LEAD_MS
+                enginePause()
+                broadcastAsync(PartyMessage.Resume(position, at))
+                scheduleHostPlay(at)
             } else {
                 broadcastAsync(PartyMessage.Pause(position))
             }
@@ -111,9 +115,10 @@ class PartyHostEngine(
             if (preparing || !hasGuests()) return
             val playing = controller?.playWhenReady == true
             if (playing) {
-                broadcastAsync(
-                    PartyMessage.Resume(newPosition.positionMs, SystemClock.elapsedRealtime() + RESUME_LEAD_MS)
-                )
+                val at = SystemClock.elapsedRealtime() + RESUME_LEAD_MS
+                enginePause()
+                broadcastAsync(PartyMessage.Resume(newPosition.positionMs, at))
+                scheduleHostPlay(at)
             } else {
                 broadcastAsync(PartyMessage.Pause(newPosition.positionMs))
             }
@@ -243,15 +248,15 @@ class PartyHostEngine(
             preparing
         }
         if (!stillPreparing) {
-            // Mid-song late joiner: start them right where the host is now.
+            // Mid-song late joiner: start them where the host will be at the
+            // scheduled instant (the host keeps playing, so lead-compensate).
             scope.launch {
                 val position = withContext(Dispatchers.Main) {
                     if (controller?.playWhenReady == true) controller?.currentPosition else null
                 } ?: return@launch
+                val at = SystemClock.elapsedRealtime() + RESUME_LEAD_MS
                 runCatching {
-                    client.send(
-                        PartyMessage.Start(songId, position, SystemClock.elapsedRealtime() + START_LEAD_MS)
-                    )
+                    client.send(PartyMessage.Start(songId, position + RESUME_LEAD_MS, at))
                 }
                 setStatus(client.memberId, PartyMemberStatus.PLAYING)
             }
@@ -298,10 +303,34 @@ class PartyHostEngine(
                 delay(200L)
             }
 
-            broadcast(PartyMessage.Start(songId, 0L, SystemClock.elapsedRealtime() + START_LEAD_MS))
+            // Scheduled start: everyone (host included) begins at the same host-clock instant.
+            val startAt = SystemClock.elapsedRealtime() + TRACK_START_LEAD_MS
+            broadcast(PartyMessage.Start(songId, 0L, startAt))
             setAllStatuses(PartyMemberStatus.PLAYING)
+            scheduleHostPlay(startAt, clearPreparing = true)
+        }
+    }
+
+    /**
+     * Plays the host's own audio at the announced host-clock instant so it
+     * lands together with the guests' scheduled starts.
+     */
+    private fun scheduleHostPlay(atHostElapsedMs: Long, clearPreparing: Boolean = false) {
+        scope.launch {
+            // Tick the countdown down to the last ~150ms, then hand over to the
+            // precise start below.
+            while (true) {
+                val remaining = atHostElapsedMs - SystemClock.elapsedRealtime()
+                if (remaining <= 150) break
+                update { it.copy(startsInMs = remaining) }
+                delay(minOf(remaining - 120, 100L))
+            }
+            update { it.copy(startsInMs = null) }
             withContext(Dispatchers.Main) {
-                preparing = false
+                // Burn the last few milliseconds for an on-the-dot start.
+                @Suppress("ControlFlowWithEmptyBody")
+                while (SystemClock.elapsedRealtime() < atHostElapsedMs) { }
+                if (clearPreparing) preparing = false
                 enginePlay()
             }
         }
@@ -388,8 +417,12 @@ class PartyHostEngine(
     private companion object {
         const val TAG = "PartyHostEngine"
         const val READY_TIMEOUT_MS = 15_000L
-        const val START_LEAD_MS = 500L
-        const val RESUME_LEAD_MS = 500L
+
+        /** Countdown before a new track starts everywhere — download settle + drama. */
+        const val TRACK_START_LEAD_MS = 5_000L
+
+        /** Short hold when the host resumes or seeks so guests can align. */
+        const val RESUME_LEAD_MS = 1_500L
         const val SOCKET_READ_TIMEOUT_MS = 30_000
     }
 }

@@ -8,10 +8,12 @@ import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.jp.paperplayer.model.data.DiscoveredParty
 import com.jp.paperplayer.model.ui.PartyRole
+import com.jp.paperplayer.model.ui.PartySyncDebug
 import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.model.ui.SyncQuality
 import com.jp.paperplayer.service.PlaybackService
@@ -20,8 +22,10 @@ import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.concurrent.thread
+import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -50,6 +54,12 @@ class PartyGuestEngine(
     private var controller: MediaController? = null
     private var preparedSongId: Long? = null
     private var preparedFile: File? = null
+
+    // Scheduled-start bookkeeping: the party timeline the drift loop chases.
+    private var pendingStartJob: Job? = null
+    private var driftJob: Job? = null
+    private var startPositionMs = 0L
+    private var startLocalInstant = 0L
 
     /** hostClock - guestClock; null until the first ping round completes. */
     @Volatile
@@ -178,8 +188,14 @@ class PartyGuestEngine(
 
     private fun onPrepare(prepare: PartyMessage.Prepare) {
         val host = hostAddress ?: return
+        pendingStartJob?.cancel()
+        driftJob?.cancel()
         update {
-            it.copy(isDownloading = true, nowPlaying = "${prepare.title} — ${prepare.artist}")
+            it.copy(
+                isDownloading = true,
+                nowPlaying = "${prepare.title} — ${prepare.artist}",
+                startsInMs = null,
+            )
         }
         scope.launch {
             try {
@@ -190,6 +206,7 @@ class PartyGuestEngine(
                 withContext(Dispatchers.Main) {
                     val c = controller ?: return@withContext
                     c.pause()
+                    c.setPlaybackParameters(PlaybackParameters.DEFAULT)
                     c.setMediaItem(buildPartyMediaItem(prepare, file))
                     c.prepare()
                 }
@@ -204,27 +221,126 @@ class PartyGuestEngine(
 
     private fun onStart(start: PartyMessage.Start) {
         if (start.songId != preparedSongId) return
-        scope.launch(Dispatchers.Main) {
-            val c = controller ?: return@launch
-            c.seekTo(start.positionMs)
-            c.play()
-        }
+        schedulePlay(start.positionMs, start.atHostElapsedMs)
         update { it.copy(error = null) }
     }
 
     private fun onPause(pause: PartyMessage.Pause) {
+        pendingStartJob?.cancel()
+        driftJob?.cancel()
+        update { it.copy(startsInMs = null) }
         scope.launch(Dispatchers.Main) {
             val c = controller ?: return@launch
+            c.setPlaybackParameters(PlaybackParameters.DEFAULT)
             c.pause()
             c.seekTo(pause.positionMs)
         }
     }
 
     private fun onResume(resume: PartyMessage.Resume) {
-        scope.launch(Dispatchers.Main) {
-            val c = controller ?: return@launch
-            c.seekTo(resume.positionMs)
-            c.play()
+        schedulePlay(resume.positionMs, resume.atHostElapsedMs)
+    }
+
+    /**
+     * Starts playback of [positionMs] exactly when this device's clock reaches
+     * the host instant [atHostElapsedMs] (converted via the measured offset).
+     * If the moment already passed — slow download, late join — starts
+     * immediately at the position the party has reached by now.
+     */
+    private fun schedulePlay(positionMs: Long, atHostElapsedMs: Long) {
+        pendingStartJob?.cancel()
+        driftJob?.cancel()
+        pendingStartJob = scope.launch {
+            val offset = clockOffsetMs ?: 0L
+            val localTarget = atHostElapsedMs - offset
+            // Tick the countdown down to the last ~150ms, then hand over to the
+            // precise start below.
+            while (true) {
+                val remaining = localTarget - SystemClock.elapsedRealtime()
+                if (remaining <= 150) break
+                update { it.copy(startsInMs = remaining) }
+                delay(minOf(remaining - 120, 100L))
+            }
+            update { it.copy(startsInMs = null) }
+            withContext(Dispatchers.Main) {
+                val c = controller ?: return@withContext
+                c.setPlaybackParameters(PlaybackParameters.DEFAULT)
+                val lateBy = SystemClock.elapsedRealtime() - localTarget
+                if (lateBy > 0) {
+                    c.seekTo(positionMs + lateBy + SEEK_LEAD_MS)
+                    c.play()
+                } else {
+                    c.seekTo(positionMs)
+                    // Burn the last few milliseconds for an on-the-dot start.
+                    @Suppress("ControlFlowWithEmptyBody")
+                    while (SystemClock.elapsedRealtime() < localTarget) { }
+                    c.play()
+                }
+                startPositionMs = positionMs
+                startLocalInstant = localTarget
+            }
+            startDriftLoop()
+        }
+    }
+
+    /**
+     * Keeps playback locked to the party timeline: big drift is corrected with
+     * a seek, small drift with an inaudible playback-speed nudge.
+     */
+    private fun startDriftLoop() {
+        driftJob?.cancel()
+        driftJob = scope.launch(Dispatchers.Main) {
+            var nudging = false
+            var seeks = 0
+            var nudges = 0
+            while (true) {
+                delay(DRIFT_CHECK_INTERVAL_MS)
+                val c = controller ?: break
+                if (!c.isPlaying) continue
+                val expected = startPositionMs + (SystemClock.elapsedRealtime() - startLocalInstant)
+                val actual = c.currentPosition
+                val drift = actual - expected
+                var speed = c.playbackParameters.speed
+                when {
+                    abs(drift) > DRIFT_SEEK_THRESHOLD_MS -> {
+                        Log.d(TAG, "Drift ${drift}ms — correcting with seek")
+                        c.setPlaybackParameters(PlaybackParameters.DEFAULT)
+                        nudging = false
+                        seeks++
+                        speed = 1f
+                        c.seekTo(expected + SEEK_LEAD_MS)
+                    }
+                    abs(drift) > DRIFT_NUDGE_THRESHOLD_MS -> {
+                        speed = if (drift > 0) NUDGE_SLOW else NUDGE_FAST
+                        c.setPlaybackParameters(PlaybackParameters(speed))
+                        if (!nudging) nudges++
+                        nudging = true
+                        Log.d(TAG, "Drift ${drift}ms — nudging at ${speed}x")
+                    }
+                    nudging && abs(drift) < DRIFT_SETTLED_MS -> {
+                        c.setPlaybackParameters(PlaybackParameters.DEFAULT)
+                        nudging = false
+                        speed = 1f
+                        Log.d(TAG, "Drift settled at ${drift}ms")
+                    }
+                }
+                val seekCount = seeks
+                val nudgeCount = nudges
+                val currentSpeed = speed
+                update {
+                    it.copy(
+                        syncDebug = it.syncDebug.copy(
+                            lastDriftMs = drift,
+                            playbackSpeed = currentSpeed,
+                            expectedPositionMs = expected,
+                            actualPositionMs = actual,
+                            seekCorrections = seekCount,
+                            nudgeCorrections = nudgeCount,
+                            driftHistory = (it.syncDebug.driftHistory + drift).takeLast(DRIFT_HISTORY_SIZE),
+                        )
+                    )
+                }
+            }
         }
     }
 
@@ -257,6 +373,8 @@ class PartyGuestEngine(
     }
 
     private fun releasePlayback() {
+        pendingStartJob?.cancel()
+        driftJob?.cancel()
         controller?.let { c ->
             ContextCompat.getMainExecutor(context).execute {
                 // Only silence playback we started; leave the host's own music alone.
@@ -296,7 +414,14 @@ class PartyGuestEngine(
         if (samples.isEmpty()) return
         clockOffsetMs = ClockSync.estimateOffsetMs(samples)
         val quality = if (ClockSync.isQualityPoor(samples)) SyncQuality.POOR else SyncQuality.GOOD
-        update { it.copy(syncQuality = quality, rttMs = ClockSync.medianRttMs(samples)) }
+        val medianRtt = ClockSync.medianRttMs(samples)
+        update {
+            it.copy(
+                syncQuality = quality,
+                rttMs = medianRtt,
+                syncDebug = it.syncDebug.copy(clockOffsetMs = clockOffsetMs, medianRttMs = medianRtt),
+            )
+        }
     }
 
     private fun onPong(pong: PartyMessage.Pong) {
@@ -308,10 +433,12 @@ class PartyGuestEngine(
         runCatching { socket?.close() }
         socket = null
         writer = null
+        pendingStartJob?.cancel()
+        driftJob?.cancel()
         scope.launch(Dispatchers.Main) { controller?.pause() }
         update {
             if (it.role == PartyRole.GUEST) {
-                it.copy(error = "Lost connection to the party", isDownloading = false)
+                it.copy(error = "Lost connection to the party", isDownloading = false, startsInMs = null)
             } else {
                 it.copy(isJoining = false)
             }
@@ -331,5 +458,15 @@ class PartyGuestEngine(
         const val TAG = "PartyGuestEngine"
         const val CONNECT_TIMEOUT_MS = 5_000
         const val OFFSET_REFRESH_INTERVAL_MS = 30_000L
+
+        /** Small lead added to corrective seeks to cover the seek latency itself. */
+        const val SEEK_LEAD_MS = 60L
+        const val DRIFT_CHECK_INTERVAL_MS = 500L
+        const val DRIFT_SEEK_THRESHOLD_MS = 150L
+        const val DRIFT_NUDGE_THRESHOLD_MS = 40L
+        const val DRIFT_SETTLED_MS = 15L
+        const val NUDGE_SLOW = 0.975f
+        const val NUDGE_FAST = 1.025f
+        const val DRIFT_HISTORY_SIZE = 60
     }
 }
