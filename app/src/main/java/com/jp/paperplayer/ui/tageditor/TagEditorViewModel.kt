@@ -4,9 +4,6 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.jp.paperplayer.lyrics.LrcParser
-import com.jp.paperplayer.metadata.MusicBrainzClient
-import com.jp.paperplayer.model.data.MusicBrainzMatch
-import com.jp.paperplayer.model.ui.SearchStatus
 import com.jp.paperplayer.model.ui.TagEditorState
 import com.jp.paperplayer.tagging.isPermissionError
 import kotlinx.coroutines.Dispatchers
@@ -23,12 +20,6 @@ class TagEditorViewModel : ViewModel() {
 
     private val _state = MutableStateFlow(TagEditorState())
     val state: StateFlow<TagEditorState> = _state.asStateFlow()
-
-    private val _metadataResults = MutableStateFlow<List<MusicBrainzMatch>>(emptyList())
-    val metadataResults: StateFlow<List<MusicBrainzMatch>> = _metadataResults.asStateFlow()
-
-    private val _metadataSearchStatus = MutableStateFlow(SearchStatus.Idle)
-    val metadataSearchStatus: StateFlow<SearchStatus> = _metadataSearchStatus.asStateFlow()
 
     fun load(filePath: String) {
         _state.value = TagEditorState(isLoading = true)
@@ -52,9 +43,6 @@ class TagEditorViewModel : ViewModel() {
                     syncedLineCount = if (isActuallySynced) parsedLines.size else 0,
                     hasUnsyncedLyrics = rawLyrics.isNotBlank() && !isActuallySynced,
                     isLoading = false,
-                    musicBrainzTrackId = tag?.getFirst(FieldKey.MUSICBRAINZ_TRACK_ID)?.takeIf { it.isNotBlank() },
-                    musicBrainzArtistId = tag?.getFirst(FieldKey.MUSICBRAINZ_ARTISTID)?.takeIf { it.isNotBlank() },
-                    musicBrainzReleaseId = tag?.getFirst(FieldKey.MUSICBRAINZ_RELEASEID)?.takeIf { it.isNotBlank() },
                 )
             } catch (e: Exception) {
                 Log.e("TagEditor", "Load failed", e)
@@ -87,9 +75,6 @@ class TagEditorViewModel : ViewModel() {
                 tag.setField(FieldKey.YEAR, fields.year)
                 tag.setField(FieldKey.TRACK, fields.trackNumber)
                 tag.setField(FieldKey.LANGUAGE, fields.language)
-                fields.musicBrainzTrackId?.let { tag.setField(FieldKey.MUSICBRAINZ_TRACK_ID, it) }
-                fields.musicBrainzArtistId?.let { tag.setField(FieldKey.MUSICBRAINZ_ARTISTID, it) }
-                fields.musicBrainzReleaseId?.let { tag.setField(FieldKey.MUSICBRAINZ_RELEASEID, it) }
                 AudioFileIO.write(audioFile)
                 true
             } catch (e: Exception) {
@@ -102,42 +87,5 @@ class TagEditorViewModel : ViewModel() {
                 onResult(success, permissionDenied)
             }
         }
-    }
-
-    fun searchMetadata() {
-        val fields = _state.value
-        _metadataResults.value = emptyList()
-        _metadataSearchStatus.value = SearchStatus.Loading
-        viewModelScope.launch(Dispatchers.IO) {
-            val results = try {
-                MusicBrainzClient.search(fields.title, fields.artist, fields.album)
-            } catch (e: Exception) {
-                Log.e("TagEditor", "MusicBrainz search failed", e)
-                emptyList()
-            }
-            withContext(Dispatchers.Main) {
-                _metadataResults.value = results
-                _metadataSearchStatus.value = if (results.isEmpty()) SearchStatus.NoResults else SearchStatus.Done
-            }
-        }
-    }
-
-    fun applyMetadataMatch(match: MusicBrainzMatch) {
-        _state.value = _state.value.copy(
-            title = match.title,
-            artist = match.artist,
-            album = match.album ?: _state.value.album,
-            year = match.year ?: _state.value.year,
-            trackNumber = match.trackNumber ?: _state.value.trackNumber,
-            musicBrainzTrackId = match.recordingId,
-            musicBrainzArtistId = match.artistId,
-            musicBrainzReleaseId = match.releaseId,
-        )
-        dismissMetadataSearch()
-    }
-
-    fun dismissMetadataSearch() {
-        _metadataResults.value = emptyList()
-        _metadataSearchStatus.value = SearchStatus.Idle
     }
 }

@@ -13,7 +13,4 @@ data class TagEditorState(
     val hasUnsyncedLyrics: Boolean = false,
     val isLoading: Boolean = true,
     val isSaving: Boolean = false,
-    val musicBrainzTrackId: String? = null,
-    val musicBrainzArtistId: String? = null,
-    val musicBrainzReleaseId: String? = null,
 )
