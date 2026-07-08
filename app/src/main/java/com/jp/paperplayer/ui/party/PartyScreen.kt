@@ -28,6 +28,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -64,6 +65,7 @@ fun PartyScreen(
 ) {
     val state by partyViewModel.state.collectAsStateWithLifecycle()
     val deviceName by partyViewModel.deviceName.collectAsStateWithLifecycle()
+    val latencyTrimMs by partyViewModel.latencyTrimMs.collectAsStateWithLifecycle()
 
     // Discover while the chooser is visible; stop scanning when leaving it.
     DisposableEffect(state.role) {
@@ -74,7 +76,9 @@ fun PartyScreen(
     PartyContent(
         state = state,
         deviceName = deviceName,
+        latencyTrimMs = latencyTrimMs,
         onDeviceNameChange = partyViewModel::setDeviceName,
+        onLatencyTrimChange = partyViewModel::setLatencyTrim,
         onStartHosting = partyViewModel::startHosting,
         onJoin = partyViewModel::join,
         onLeave = partyViewModel::leaveParty,
@@ -92,6 +96,8 @@ private fun PartyContent(
     onJoin: (DiscoveredParty) -> Unit,
     onLeave: () -> Unit,
     onNavigateBack: () -> Unit,
+    latencyTrimMs: Long = 0L,
+    onLatencyTrimChange: (Long) -> Unit = {},
 ) {
     Scaffold(
         topBar = {
@@ -135,7 +141,12 @@ private fun PartyContent(
                     onJoin = onJoin,
                 )
                 PartyRole.HOST -> HostView(state = state, onEndParty = onLeave)
-                PartyRole.GUEST -> GuestView(state = state, onLeave = onLeave)
+                PartyRole.GUEST -> GuestView(
+                    state = state,
+                    latencyTrimMs = latencyTrimMs,
+                    onLatencyTrimChange = onLatencyTrimChange,
+                    onLeave = onLeave,
+                )
             }
         }
     }
@@ -278,7 +289,12 @@ private fun ColumnScope.HostView(state: PartyUiState, onEndParty: () -> Unit) {
 }
 
 @Composable
-private fun GuestView(state: PartyUiState, onLeave: () -> Unit) {
+private fun GuestView(
+    state: PartyUiState,
+    latencyTrimMs: Long,
+    onLatencyTrimChange: (Long) -> Unit,
+    onLeave: () -> Unit,
+) {
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -326,6 +342,9 @@ private fun GuestView(state: PartyUiState, onLeave: () -> Unit) {
             Spacer(Modifier.height(12.dp))
             StartCountdown(remainingMs = remaining)
         }
+        Spacer(Modifier.height(20.dp))
+        LatencyTrimSlider(trimMs = latencyTrimMs, onTrimChange = onLatencyTrimChange)
+
         var showDebug by remember { mutableStateOf(false) }
         TextButton(onClick = { showDebug = !showDebug }) {
             Text(if (showDebug) "Hide sync details" else "Show sync details")
@@ -405,6 +424,34 @@ private fun DebugRow(label: String, value: String) {
 }
 
 private fun formatDebugSeconds(ms: Long): String = "%d.%01ds".format(ms / 1000, (ms % 1000) / 100)
+
+@Composable
+private fun LatencyTrimSlider(trimMs: Long, onTrimChange: (Long) -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "Audio latency trim",
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = "${if (trimMs > 0) "+" else ""}$trimMs ms",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+            )
+        }
+        Slider(
+            value = trimMs.toFloat(),
+            onValueChange = { onTrimChange((it / 10f).toInt() * 10L) },
+            valueRange = -300f..300f,
+        )
+        Text(
+            text = "If this device sounds late, drag right until the echo disappears",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
 
 @Composable
 private fun StartCountdown(remainingMs: Long) {

@@ -12,6 +12,7 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.jp.paperplayer.model.data.DiscoveredParty
+import com.jp.paperplayer.data.SettingsStore
 import com.jp.paperplayer.model.ui.PartyRole
 import com.jp.paperplayer.model.ui.PartySyncDebug
 import com.jp.paperplayer.model.ui.PartyUiState
@@ -65,6 +66,14 @@ class PartyGuestEngine(
     @Volatile
     var clockOffsetMs: Long? = null
         private set
+
+    /**
+     * Manual audio-latency compensation set by the user: positive means this
+     * device's speaker output is late, so the player runs that far ahead of
+     * the party timeline. The drift loop picks up changes within a tick.
+     */
+    @Volatile
+    var latencyTrimMs: Long = SettingsStore(context).getPartyLatencyTrimMs()
 
     private var pingSeq = 0
     private val pendingSamples = mutableListOf<PingSample>()
@@ -267,10 +276,10 @@ class PartyGuestEngine(
                 c.setPlaybackParameters(PlaybackParameters.DEFAULT)
                 val lateBy = SystemClock.elapsedRealtime() - localTarget
                 if (lateBy > 0) {
-                    c.seekTo(positionMs + lateBy + SEEK_LEAD_MS)
+                    c.seekTo(positionMs + lateBy + SEEK_LEAD_MS + latencyTrimMs)
                     c.play()
                 } else {
-                    c.seekTo(positionMs)
+                    c.seekTo(positionMs + latencyTrimMs)
                     // Burn the last few milliseconds for an on-the-dot start.
                     @Suppress("ControlFlowWithEmptyBody")
                     while (SystemClock.elapsedRealtime() < localTarget) { }
@@ -297,7 +306,7 @@ class PartyGuestEngine(
                 delay(DRIFT_CHECK_INTERVAL_MS)
                 val c = controller ?: break
                 if (!c.isPlaying) continue
-                val expected = startPositionMs + (SystemClock.elapsedRealtime() - startLocalInstant)
+                val expected = startPositionMs + (SystemClock.elapsedRealtime() - startLocalInstant) + latencyTrimMs
                 val actual = c.currentPosition
                 val drift = actual - expected
                 var speed = c.playbackParameters.speed

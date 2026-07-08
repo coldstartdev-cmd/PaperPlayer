@@ -36,9 +36,20 @@ class SettingsStore(context: Context) {
         prefs.edit().putString(KEY_PARTY_DEVICE_NAME, name).apply()
     }
 
+    /**
+     * Manual audio-latency trim for party mode, in milliseconds. Positive means
+     * this device's speaker is late, so its player runs ahead to compensate.
+     */
+    fun getPartyLatencyTrimMs(): Long = prefs.getLong(KEY_PARTY_LATENCY_TRIM, 0L)
+
+    fun setPartyLatencyTrimMs(trimMs: Long) {
+        prefs.edit().putLong(KEY_PARTY_LATENCY_TRIM, trimMs).apply()
+    }
+
     private companion object {
         const val KEY_SHUFFLE_STRATEGY = "shuffle_strategy"
         const val KEY_EXCLUDED_FOLDERS = "excluded_folders"
         const val KEY_PARTY_DEVICE_NAME = "party_device_name"
+        const val KEY_PARTY_LATENCY_TRIM = "party_latency_trim"
     }
 }

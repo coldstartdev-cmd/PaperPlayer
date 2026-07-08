@@ -42,6 +42,11 @@ object PartyManager {
         engine.join(party, deviceName)
     }
 
+    /** Applies a new audio-latency trim to the active guest session, if any. */
+    fun setLatencyTrim(trimMs: Long) {
+        guestEngine?.latencyTrimMs = trimMs
+    }
+
     /** Ends hosting or leaves as guest; resets to the idle state. */
     fun stop() {
         hostEngine?.stop()

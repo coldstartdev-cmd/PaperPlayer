@@ -22,9 +22,18 @@ class PartyViewModel(app: Application) : AndroidViewModel(app) {
     )
     val deviceName: StateFlow<String> = _deviceName
 
+    private val _latencyTrimMs = MutableStateFlow(settingsStore.getPartyLatencyTrimMs())
+    val latencyTrimMs: StateFlow<Long> = _latencyTrimMs
+
     fun setDeviceName(name: String) {
         _deviceName.value = name
         settingsStore.setPartyDeviceName(name)
+    }
+
+    fun setLatencyTrim(trimMs: Long) {
+        _latencyTrimMs.value = trimMs
+        settingsStore.setPartyLatencyTrimMs(trimMs)
+        PartyManager.setLatencyTrim(trimMs)
     }
 
     fun startHosting() {
