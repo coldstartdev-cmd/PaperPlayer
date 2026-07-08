@@ -13,6 +13,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.jp.paperplayer.model.data.DiscoveredParty
 import com.jp.paperplayer.model.ui.PartyRole
+import com.jp.paperplayer.model.ui.PartySyncDebug
 import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.model.ui.SyncQuality
 import com.jp.paperplayer.service.PlaybackService
@@ -278,30 +279,54 @@ class PartyGuestEngine(
         driftJob?.cancel()
         driftJob = scope.launch(Dispatchers.Main) {
             var nudging = false
+            var seeks = 0
+            var nudges = 0
             while (true) {
                 delay(DRIFT_CHECK_INTERVAL_MS)
                 val c = controller ?: break
                 if (!c.isPlaying) continue
                 val expected = startPositionMs + (SystemClock.elapsedRealtime() - startLocalInstant)
-                val drift = c.currentPosition - expected
+                val actual = c.currentPosition
+                val drift = actual - expected
+                var speed = c.playbackParameters.speed
                 when {
                     abs(drift) > DRIFT_SEEK_THRESHOLD_MS -> {
                         Log.d(TAG, "Drift ${drift}ms — correcting with seek")
                         c.setPlaybackParameters(PlaybackParameters.DEFAULT)
                         nudging = false
+                        seeks++
+                        speed = 1f
                         c.seekTo(expected + SEEK_LEAD_MS)
                     }
                     abs(drift) > DRIFT_NUDGE_THRESHOLD_MS -> {
-                        val speed = if (drift > 0) NUDGE_SLOW else NUDGE_FAST
+                        speed = if (drift > 0) NUDGE_SLOW else NUDGE_FAST
                         c.setPlaybackParameters(PlaybackParameters(speed))
+                        if (!nudging) nudges++
                         nudging = true
                         Log.d(TAG, "Drift ${drift}ms — nudging at ${speed}x")
                     }
                     nudging && abs(drift) < DRIFT_SETTLED_MS -> {
                         c.setPlaybackParameters(PlaybackParameters.DEFAULT)
                         nudging = false
+                        speed = 1f
                         Log.d(TAG, "Drift settled at ${drift}ms")
                     }
+                }
+                val seekCount = seeks
+                val nudgeCount = nudges
+                val currentSpeed = speed
+                update {
+                    it.copy(
+                        syncDebug = it.syncDebug.copy(
+                            lastDriftMs = drift,
+                            playbackSpeed = currentSpeed,
+                            expectedPositionMs = expected,
+                            actualPositionMs = actual,
+                            seekCorrections = seekCount,
+                            nudgeCorrections = nudgeCount,
+                            driftHistory = (it.syncDebug.driftHistory + drift).takeLast(DRIFT_HISTORY_SIZE),
+                        )
+                    )
                 }
             }
         }
@@ -377,7 +402,14 @@ class PartyGuestEngine(
         if (samples.isEmpty()) return
         clockOffsetMs = ClockSync.estimateOffsetMs(samples)
         val quality = if (ClockSync.isQualityPoor(samples)) SyncQuality.POOR else SyncQuality.GOOD
-        update { it.copy(syncQuality = quality, rttMs = ClockSync.medianRttMs(samples)) }
+        val medianRtt = ClockSync.medianRttMs(samples)
+        update {
+            it.copy(
+                syncQuality = quality,
+                rttMs = medianRtt,
+                syncDebug = it.syncDebug.copy(clockOffsetMs = clockOffsetMs, medianRttMs = medianRtt),
+            )
+        }
     }
 
     private fun onPong(pong: PartyMessage.Pong) {
@@ -423,5 +455,6 @@ class PartyGuestEngine(
         const val DRIFT_SETTLED_MS = 15L
         const val NUDGE_SLOW = 0.975f
         const val NUDGE_FAST = 1.025f
+        const val DRIFT_HISTORY_SIZE = 60
     }
 }

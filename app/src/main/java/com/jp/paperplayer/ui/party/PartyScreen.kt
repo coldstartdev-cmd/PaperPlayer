@@ -1,5 +1,6 @@
 package com.jp.paperplayer.ui.party
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -29,12 +30,18 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -43,8 +50,10 @@ import com.jp.paperplayer.model.data.DiscoveredParty
 import com.jp.paperplayer.model.data.PartyMember
 import com.jp.paperplayer.model.data.PartyMemberStatus
 import com.jp.paperplayer.model.ui.PartyRole
+import com.jp.paperplayer.model.ui.PartySyncDebug
 import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.model.ui.SyncQuality
+import kotlin.math.abs
 import com.jp.paperplayer.ui.preview.PreviewFixtures
 import com.jp.paperplayer.ui.theme.PaperPlayerTheme
 
@@ -310,12 +319,85 @@ private fun GuestView(state: PartyUiState, onLeave: () -> Unit) {
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        Spacer(Modifier.height(32.dp))
+        var showDebug by remember { mutableStateOf(false) }
+        TextButton(onClick = { showDebug = !showDebug }) {
+            Text(if (showDebug) "Hide sync details" else "Show sync details")
+        }
+        if (showDebug) {
+            SyncDebugPanel(debug = state.syncDebug)
+        }
+        Spacer(Modifier.height(24.dp))
         OutlinedButton(onClick = onLeave) {
             Text("Leave party")
         }
     }
 }
+
+@Composable
+private fun SyncDebugPanel(debug: PartySyncDebug) {
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+        DebugRow("Clock offset", debug.clockOffsetMs?.let { "$it ms" } ?: "—")
+        DebugRow("Median RTT", debug.medianRttMs?.let { "$it ms" } ?: "—")
+        DebugRow("Drift", debug.lastDriftMs?.let { "$it ms" } ?: "—")
+        DebugRow("Playback speed", "${debug.playbackSpeed}x")
+        DebugRow(
+            "Expected / actual",
+            "${formatDebugSeconds(debug.expectedPositionMs)} / ${formatDebugSeconds(debug.actualPositionMs)}",
+        )
+        DebugRow("Corrections", "${debug.nudgeCorrections} nudges · ${debug.seekCorrections} seeks")
+
+        if (debug.driftHistory.size >= 2) {
+            val lineColor = MaterialTheme.colorScheme.primary
+            val axisColor = MaterialTheme.colorScheme.outlineVariant
+            Text(
+                text = "Drift over the last ${debug.driftHistory.size / 2} seconds",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            Canvas(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .padding(vertical = 4.dp),
+            ) {
+                val history = debug.driftHistory
+                val range = maxOf(history.maxOf { abs(it) }, 50L).toFloat()
+                val midY = size.height / 2f
+                drawLine(axisColor, Offset(0f, midY), Offset(size.width, midY), strokeWidth = 1f)
+                val stepX = size.width / (history.size - 1).coerceAtLeast(1)
+                var previous: Offset? = null
+                history.forEachIndexed { index, drift ->
+                    val point = Offset(
+                        x = index * stepX,
+                        y = midY - (drift / range) * (size.height / 2f - 2f),
+                    )
+                    previous?.let { drawLine(lineColor, it, point, strokeWidth = 3f) }
+                    previous = point
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DebugRow(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+        )
+    }
+}
+
+private fun formatDebugSeconds(ms: Long): String = "%d.%01ds".format(ms / 1000, (ms % 1000) / 100)
 
 @Composable
 private fun SyncQualityChip(quality: SyncQuality, rttMs: Long?) {
@@ -367,6 +449,26 @@ internal fun PartyHostPreview() {
             onJoin = {},
             onLeave = {},
             onNavigateBack = {},
+        )
+    }
+}
+
+@Preview(showBackground = true, name = "Sync debug panel")
+@Composable
+internal fun SyncDebugPanelPreview() {
+    PaperPlayerTheme {
+        SyncDebugPanel(
+            debug = PartySyncDebug(
+                clockOffsetMs = -142L,
+                medianRttMs = 12L,
+                lastDriftMs = 18L,
+                playbackSpeed = 1f,
+                expectedPositionMs = 63_400L,
+                actualPositionMs = 63_418L,
+                seekCorrections = 1,
+                nudgeCorrections = 4,
+                driftHistory = listOf(120L, 90L, 60L, 40L, 22L, 10L, 4L, -6L, -12L, -8L, -2L, 6L, 14L, 18L),
+            )
         )
     }
 }
