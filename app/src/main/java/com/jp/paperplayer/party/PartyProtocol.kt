@@ -69,6 +69,62 @@ sealed class PartyMessage {
             .put("t1", t1)
     }
 
+    /**
+     * Host -> guest: download this song and prepare it for playback. The guest
+     * builds the download URL from the resolved host address plus the httpPort
+     * from WELCOME: http://host:port/song/{songId}.
+     */
+    data class Prepare(
+        val songId: Long,
+        val title: String,
+        val artist: String,
+        val album: String,
+        val durationMs: Long,
+        val ext: String,
+        val sizeBytes: Long,
+    ) : PartyMessage() {
+        override fun toJson(): JSONObject = JSONObject()
+            .put("type", "PREPARE")
+            .put("songId", songId)
+            .put("title", title)
+            .put("artist", artist)
+            .put("album", album)
+            .put("durationMs", durationMs)
+            .put("ext", ext)
+            .put("sizeBytes", sizeBytes)
+    }
+
+    /** Guest -> host: song downloaded and the player is prepared, paused at zero. */
+    data class Ready(val songId: Long) : PartyMessage() {
+        override fun toJson(): JSONObject = JSONObject()
+            .put("type", "READY")
+            .put("songId", songId)
+    }
+
+    /** Host -> guest: begin playback of [songId] at [positionMs] at host time [atHostElapsedMs]. */
+    data class Start(val songId: Long, val positionMs: Long, val atHostElapsedMs: Long) : PartyMessage() {
+        override fun toJson(): JSONObject = JSONObject()
+            .put("type", "START")
+            .put("songId", songId)
+            .put("positionMs", positionMs)
+            .put("atHostElapsedMs", atHostElapsedMs)
+    }
+
+    /** Host -> guest: pause immediately and snap to [positionMs]. */
+    data class Pause(val positionMs: Long) : PartyMessage() {
+        override fun toJson(): JSONObject = JSONObject()
+            .put("type", "PAUSE")
+            .put("positionMs", positionMs)
+    }
+
+    /** Host -> guest: resume (or re-position after a seek) at host time [atHostElapsedMs]. */
+    data class Resume(val positionMs: Long, val atHostElapsedMs: Long) : PartyMessage() {
+        override fun toJson(): JSONObject = JSONObject()
+            .put("type", "RESUME")
+            .put("positionMs", positionMs)
+            .put("atHostElapsedMs", atHostElapsedMs)
+    }
+
     /** Either direction: graceful leave / party end. */
     data object Bye : PartyMessage() {
         override fun toJson(): JSONObject = JSONObject().put("type", "BYE")
@@ -93,6 +149,23 @@ sealed class PartyMessage {
                 "ERROR" -> Error(json.optString("reason", "Unknown error"))
                 "PING" -> Ping(json.optInt("seq"), json.optLong("t0"))
                 "PONG" -> Pong(json.optInt("seq"), json.optLong("t0"), json.optLong("t1"))
+                "PREPARE" -> Prepare(
+                    songId = json.optLong("songId"),
+                    title = json.optString("title"),
+                    artist = json.optString("artist"),
+                    album = json.optString("album"),
+                    durationMs = json.optLong("durationMs"),
+                    ext = json.optString("ext", "mp3"),
+                    sizeBytes = json.optLong("sizeBytes", -1L),
+                )
+                "READY" -> Ready(json.optLong("songId"))
+                "START" -> Start(
+                    songId = json.optLong("songId"),
+                    positionMs = json.optLong("positionMs"),
+                    atHostElapsedMs = json.optLong("atHostElapsedMs"),
+                )
+                "PAUSE" -> Pause(json.optLong("positionMs"))
+                "RESUME" -> Resume(json.optLong("positionMs"), json.optLong("atHostElapsedMs"))
                 "BYE" -> Bye
                 else -> null
             }
