@@ -22,7 +22,15 @@ class SettingsStore(context: Context) {
         prefs.edit().putString(KEY_SHUFFLE_STRATEGY, strategy.name).apply()
     }
 
+    fun getExcludedFolders(): Set<String> =
+        prefs.getStringSet(KEY_EXCLUDED_FOLDERS, null)?.toSet() ?: emptySet()
+
+    fun setExcludedFolders(folders: Set<String>) {
+        prefs.edit().putStringSet(KEY_EXCLUDED_FOLDERS, folders.toSet()).apply()
+    }
+
     private companion object {
         const val KEY_SHUFFLE_STRATEGY = "shuffle_strategy"
+        const val KEY_EXCLUDED_FOLDERS = "excluded_folders"
     }
 }
