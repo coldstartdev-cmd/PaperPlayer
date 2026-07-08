@@ -289,6 +289,27 @@ private fun GuestView(state: PartyUiState, onLeave: () -> Unit) {
         }
         Spacer(Modifier.height(16.dp))
         SyncQualityChip(quality = state.syncQuality, rttMs = state.rttMs)
+        state.nowPlaying?.let { nowPlaying ->
+            Spacer(Modifier.height(24.dp))
+            if (state.isDownloading) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(
+                        text = "Downloading…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+            Text(
+                text = nowPlaying,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
         Spacer(Modifier.height(32.dp))
         OutlinedButton(onClick = onLeave) {
             Text("Leave party")
@@ -361,6 +382,7 @@ internal fun PartyGuestPreview() {
                 connectedHostName = "Pixel 7",
                 syncQuality = SyncQuality.GOOD,
                 rttMs = 6L,
+                nowPlaying = "Midnight City — M83",
             ),
             deviceName = "Galaxy S23",
             onDeviceNameChange = {},

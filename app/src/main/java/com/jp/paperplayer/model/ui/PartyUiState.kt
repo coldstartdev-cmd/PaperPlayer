@@ -20,5 +20,8 @@ data class PartyUiState(
     val isJoining: Boolean = false,
     val syncQuality: SyncQuality = SyncQuality.UNKNOWN,
     val rttMs: Long? = null,
+    /** "Title — Artist" of the track the host is sharing (guest role only). */
+    val nowPlaying: String? = null,
+    val isDownloading: Boolean = false,
     val error: String? = null,
 )
