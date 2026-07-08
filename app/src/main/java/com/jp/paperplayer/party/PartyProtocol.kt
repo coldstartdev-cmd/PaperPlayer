@@ -125,6 +125,25 @@ sealed class PartyMessage {
             .put("atHostElapsedMs", atHostElapsedMs)
     }
 
+    /** Guest -> host: please emit a calibration chirp so I can measure latency. */
+    data object CalibrateRequest : PartyMessage() {
+        override fun toJson(): JSONObject = JSONObject().put("type", "CALIBRATE_REQUEST")
+    }
+
+    /** Host -> guest: the host will emit its chirp at host time [atHostElapsedMs]. */
+    data class CalibrateChirp(val atHostElapsedMs: Long) : PartyMessage() {
+        override fun toJson(): JSONObject = JSONObject()
+            .put("type", "CALIBRATE_CHIRP")
+            .put("atHostElapsedMs", atHostElapsedMs)
+    }
+
+    /** Host -> guest: calibration can't run right now. */
+    data class CalibrateDenied(val reason: String) : PartyMessage() {
+        override fun toJson(): JSONObject = JSONObject()
+            .put("type", "CALIBRATE_DENIED")
+            .put("reason", reason)
+    }
+
     /** Either direction: graceful leave / party end. */
     data object Bye : PartyMessage() {
         override fun toJson(): JSONObject = JSONObject().put("type", "BYE")
@@ -166,6 +185,9 @@ sealed class PartyMessage {
                 )
                 "PAUSE" -> Pause(json.optLong("positionMs"))
                 "RESUME" -> Resume(json.optLong("positionMs"), json.optLong("atHostElapsedMs"))
+                "CALIBRATE_REQUEST" -> CalibrateRequest
+                "CALIBRATE_CHIRP" -> CalibrateChirp(json.optLong("atHostElapsedMs"))
+                "CALIBRATE_DENIED" -> CalibrateDenied(json.optString("reason", "Calibration unavailable"))
                 "BYE" -> Bye
                 else -> null
             }

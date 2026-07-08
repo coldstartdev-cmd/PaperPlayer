@@ -24,10 +24,12 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.concurrent.thread
 import kotlin.math.abs
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -77,6 +79,7 @@ class PartyGuestEngine(
 
     private var pingSeq = 0
     private val pendingSamples = mutableListOf<PingSample>()
+    private var pendingCalibration: CompletableDeferred<PartyMessage?>? = null
 
     fun startDiscovery() {
         update { it.copy(isDiscovering = true, discovered = emptyList(), error = null) }
@@ -167,6 +170,8 @@ class PartyGuestEngine(
                     is PartyMessage.Start -> onStart(message)
                     is PartyMessage.Pause -> onPause(message)
                     is PartyMessage.Resume -> onResume(message)
+                    is PartyMessage.CalibrateChirp -> pendingCalibration?.complete(message)
+                    is PartyMessage.CalibrateDenied -> pendingCalibration?.complete(message)
                     is PartyMessage.Bye -> break
                     else -> {}
                 }
@@ -401,6 +406,32 @@ class PartyGuestEngine(
         preparedFile = null
     }
 
+    /**
+     * Runs the acoustic latency calibration: asks the host to chirp, chirps
+     * back 800ms later, and measures the relative output latency from one mic
+     * recording. Returns the measured trim, or a failure with a user-facing
+     * reason. Caller must already hold RECORD_AUDIO.
+     */
+    suspend fun calibrate(): LatencyCalibrator.Result {
+        val deferred = CompletableDeferred<PartyMessage?>()
+        pendingCalibration = deferred
+        runCatching { send(PartyMessage.CalibrateRequest) }
+        val reply = withTimeoutOrNull(CALIBRATE_REPLY_TIMEOUT_MS) { deferred.await() }
+        pendingCalibration = null
+        return when (reply) {
+            is PartyMessage.CalibrateChirp -> {
+                val offset = clockOffsetMs ?: 0L
+                val hostChirpLocal = reply.atHostElapsedMs - offset
+                LatencyCalibrator().measure(
+                    hostChirpAtLocalMs = hostChirpLocal,
+                    ownChirpAtLocalMs = hostChirpLocal + OWN_CHIRP_DELAY_MS,
+                )
+            }
+            is PartyMessage.CalibrateDenied -> LatencyCalibrator.Result.Failure(reply.reason)
+            else -> LatencyCalibrator.Result.Failure("The host didn't respond — try again")
+        }
+    }
+
     // ── Clock sync ──────────────────────────────────────────────────────────
 
     private suspend fun pingRounds() {
@@ -477,5 +508,7 @@ class PartyGuestEngine(
         const val NUDGE_SLOW = 0.975f
         const val NUDGE_FAST = 1.025f
         const val DRIFT_HISTORY_SIZE = 60
+        const val CALIBRATE_REPLY_TIMEOUT_MS = 5_000L
+        const val OWN_CHIRP_DELAY_MS = 800L
     }
 }

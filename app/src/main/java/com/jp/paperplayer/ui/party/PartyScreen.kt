@@ -1,5 +1,9 @@
 package com.jp.paperplayer.ui.party
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -42,6 +46,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -66,6 +72,15 @@ fun PartyScreen(
     val state by partyViewModel.state.collectAsStateWithLifecycle()
     val deviceName by partyViewModel.deviceName.collectAsStateWithLifecycle()
     val latencyTrimMs by partyViewModel.latencyTrimMs.collectAsStateWithLifecycle()
+    val isCalibrating by partyViewModel.isCalibrating.collectAsStateWithLifecycle()
+    val calibrationMessage by partyViewModel.calibrationMessage.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) partyViewModel.calibrate()
+    }
 
     // Discover while the chooser is visible; stop scanning when leaving it.
     DisposableEffect(state.role) {
@@ -77,8 +92,17 @@ fun PartyScreen(
         state = state,
         deviceName = deviceName,
         latencyTrimMs = latencyTrimMs,
+        isCalibrating = isCalibrating,
+        calibrationMessage = calibrationMessage,
         onDeviceNameChange = partyViewModel::setDeviceName,
         onLatencyTrimChange = partyViewModel::setLatencyTrim,
+        onCalibrate = {
+            val granted = ContextCompat.checkSelfPermission(
+                context, Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (granted) partyViewModel.calibrate()
+            else micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        },
         onStartHosting = partyViewModel::startHosting,
         onJoin = partyViewModel::join,
         onLeave = partyViewModel::leaveParty,
@@ -98,6 +122,9 @@ private fun PartyContent(
     onNavigateBack: () -> Unit,
     latencyTrimMs: Long = 0L,
     onLatencyTrimChange: (Long) -> Unit = {},
+    isCalibrating: Boolean = false,
+    calibrationMessage: String? = null,
+    onCalibrate: () -> Unit = {},
 ) {
     Scaffold(
         topBar = {
@@ -144,7 +171,10 @@ private fun PartyContent(
                 PartyRole.GUEST -> GuestView(
                     state = state,
                     latencyTrimMs = latencyTrimMs,
+                    isCalibrating = isCalibrating,
+                    calibrationMessage = calibrationMessage,
                     onLatencyTrimChange = onLatencyTrimChange,
+                    onCalibrate = onCalibrate,
                     onLeave = onLeave,
                 )
             }
@@ -292,7 +322,10 @@ private fun ColumnScope.HostView(state: PartyUiState, onEndParty: () -> Unit) {
 private fun GuestView(
     state: PartyUiState,
     latencyTrimMs: Long,
+    isCalibrating: Boolean,
+    calibrationMessage: String?,
     onLatencyTrimChange: (Long) -> Unit,
+    onCalibrate: () -> Unit,
     onLeave: () -> Unit,
 ) {
     Column(
@@ -344,6 +377,22 @@ private fun GuestView(
         }
         Spacer(Modifier.height(20.dp))
         LatencyTrimSlider(trimMs = latencyTrimMs, onTrimChange = onLatencyTrimChange)
+
+        OutlinedButton(onClick = onCalibrate, enabled = !isCalibrating) {
+            if (isCalibrating) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.size(8.dp))
+            }
+            Text(if (isCalibrating) "Calibrating…" else "Calibrate automatically")
+        }
+        calibrationMessage?.let { message ->
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
 
         var showDebug by remember { mutableStateOf(false) }
         TextButton(onClick = { showDebug = !showDebug }) {

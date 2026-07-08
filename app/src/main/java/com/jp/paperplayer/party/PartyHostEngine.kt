@@ -62,6 +62,7 @@ class PartyHostEngine(
     private var currentSongId: Long? = null
     private var awaitingReady = mutableSetOf<String>()
     private var songCache: Map<Long, Song>? = null
+    private var calibrating = false
 
     private class ClientConnection(
         val memberId: String,
@@ -215,6 +216,7 @@ class PartyHostEngine(
                         PartyMessage.Pong(message.seq, message.t0, SystemClock.elapsedRealtime())
                     )
                     is PartyMessage.Ready -> onGuestReady(client, message.songId)
+                    is PartyMessage.CalibrateRequest -> onCalibrateRequest(client)
                     is PartyMessage.Bye -> break
                     else -> {}
                 }
@@ -259,6 +261,36 @@ class PartyHostEngine(
                     client.send(PartyMessage.Start(songId, position + RESUME_LEAD_MS, at))
                 }
                 setStatus(client.memberId, PartyMemberStatus.PLAYING)
+            }
+        }
+    }
+
+    /**
+     * Emits the host calibration chirp at an announced instant so the guest can
+     * measure the relative output latency. Music is paused (which propagates to
+     * all guests) so the room is quiet during the chirps.
+     */
+    private fun onCalibrateRequest(client: ClientConnection) {
+        synchronized(this) {
+            if (calibrating) {
+                runCatching { client.send(PartyMessage.CalibrateDenied("Another device is calibrating — try again in a moment")) }
+                return
+            }
+            calibrating = true
+        }
+        scope.launch {
+            try {
+                withContext(Dispatchers.Main) {
+                    // A plain pause (not enginePause) so the pause propagates to guests.
+                    if (controller?.playWhenReady == true) controller?.pause()
+                }
+                val at = SystemClock.elapsedRealtime() + CALIBRATE_LEAD_MS
+                runCatching { client.send(PartyMessage.CalibrateChirp(at)) }
+                ChirpPlayer.playAt(Chirp.hostChirpPcm(), at)
+                // Stay busy until the guest's own chirp (+tail) has passed.
+                delay(CALIBRATE_LEAD_MS + 1_500L)
+            } finally {
+                synchronized(this@PartyHostEngine) { calibrating = false }
             }
         }
     }
@@ -423,6 +455,9 @@ class PartyHostEngine(
 
         /** Short hold when the host resumes or seeks so guests can align. */
         const val RESUME_LEAD_MS = 1_500L
+
+        /** Lead time announced before the host's calibration chirp. */
+        const val CALIBRATE_LEAD_MS = 1_500L
         const val SOCKET_READ_TIMEOUT_MS = 30_000
     }
 }
