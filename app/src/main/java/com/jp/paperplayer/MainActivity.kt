@@ -21,6 +21,8 @@ import androidx.navigation.navArgument
 import com.jp.paperplayer.ui.components.MiniPlayer
 import com.jp.paperplayer.ui.lyricseditor.LyricsEditorScreen
 import com.jp.paperplayer.ui.lyricseditor.LyricsEditorViewModel
+import com.jp.paperplayer.ui.party.PartyScreen
+import com.jp.paperplayer.ui.party.PartyViewModel
 import com.jp.paperplayer.ui.player.PlayerScreen
 import com.jp.paperplayer.ui.player.PlayerViewModel
 import com.jp.paperplayer.ui.playstats.PlayStatsScreen
@@ -41,6 +43,7 @@ class MainActivity : ComponentActivity() {
     private val lyricsEditorViewModel: LyricsEditorViewModel by viewModels()
     private val translationEditorViewModel: TranslationEditorViewModel by viewModels()
     private val tagEditorViewModel: TagEditorViewModel by viewModels()
+    private val partyViewModel: PartyViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -85,7 +88,14 @@ class MainActivity : ComponentActivity() {
                                 onNavigateToPlayer = { navController.navigate("player") },
                                 onNavigateToStats = { navController.navigate("play_stats") },
                                 onNavigateToSettings = { navController.navigate("settings") },
+                                onNavigateToParty = { navController.navigate("party") },
                                 onEditTags = { songId -> navController.navigate("tag_editor/$songId") },
+                            )
+                        }
+                        composable("party") {
+                            PartyScreen(
+                                partyViewModel = partyViewModel,
+                                onNavigateBack = { navController.popBackStack() },
                             )
                         }
                         composable("settings") {

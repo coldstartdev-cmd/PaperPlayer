@@ -1,9 +1,12 @@
 package com.jp.paperplayer.ui.preview
 
 import android.net.Uri
+import com.jp.paperplayer.model.data.DiscoveredParty
 import com.jp.paperplayer.model.data.LrcTrack
 import com.jp.paperplayer.model.data.LyricLine
 import com.jp.paperplayer.model.data.MusicFolder
+import com.jp.paperplayer.model.data.PartyMember
+import com.jp.paperplayer.model.data.PartyMemberStatus
 import com.jp.paperplayer.model.data.Song
 import com.jp.paperplayer.model.ui.EditorLine
 import com.jp.paperplayer.model.ui.PlayerState
@@ -43,6 +46,16 @@ internal object PreviewFixtures {
     )
 
     val playCounts = mapOf(1L to 42, 2L to 17, 3L to 5)
+
+    val discoveredParties = listOf(
+        DiscoveredParty("Pixel 7's party", "192.168.1.23", 40331),
+        DiscoveredParty("Living room", "192.168.1.40", 40118),
+    )
+
+    val partyMembers = listOf(
+        PartyMember("m1", "Galaxy S23", PartyMemberStatus.READY),
+        PartyMember("m2", "Redmi Note 12", PartyMemberStatus.SYNCING),
+    )
 
     val musicFolders = listOf(
         MusicFolder("/storage/emulated/0/Music", "Music", 24, excluded = false),

@@ -5,6 +5,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Party mode: LAN discovery (mDNS) and connectivity state -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <!-- Storage: READ_MEDIA_AUDIO for API 33+, READ_EXTERNAL_STORAGE for API 24-32 -->
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission

@@ -24,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Settings
@@ -68,6 +69,7 @@ fun SongListScreen(
     onNavigateToPlayer: () -> Unit,
     onNavigateToStats: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToParty: () -> Unit,
     onEditTags: (Long) -> Unit,
 ) {
     val songs by songListViewModel.songs.collectAsStateWithLifecycle()
@@ -112,6 +114,7 @@ fun SongListScreen(
         },
         onNavigateToStats = onNavigateToStats,
         onNavigateToSettings = onNavigateToSettings,
+        onNavigateToParty = onNavigateToParty,
         onSongClick = { index ->
             playerViewModel.play(songs, index)
             onNavigateToPlayer()
@@ -131,6 +134,7 @@ private fun SongListContent(
     onShuffle: () -> Unit,
     onNavigateToStats: () -> Unit,
     onNavigateToSettings: () -> Unit = {},
+    onNavigateToParty: () -> Unit = {},
     onSongClick: (Int) -> Unit,
     onPlayNext: (Song) -> Unit,
     onEditTags: (Long) -> Unit,
@@ -197,6 +201,16 @@ private fun SongListContent(
                             },
                         )
                     }
+                    DropdownMenuItem(
+                        text = { Text("Party mode") },
+                        leadingIcon = {
+                            Icon(Icons.Filled.Groups, contentDescription = null, tint = cs.onSurfaceVariant)
+                        },
+                        onClick = {
+                            showMenu = false
+                            onNavigateToParty()
+                        },
+                    )
                     DropdownMenuItem(
                         text = { Text("Play stats") },
                         leadingIcon = {

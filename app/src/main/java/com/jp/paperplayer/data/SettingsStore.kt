@@ -29,8 +29,16 @@ class SettingsStore(context: Context) {
         prefs.edit().putStringSet(KEY_EXCLUDED_FOLDERS, folders.toSet()).apply()
     }
 
+    /** Display name shown to other devices in party mode; blank means device model. */
+    fun getPartyDeviceName(): String = prefs.getString(KEY_PARTY_DEVICE_NAME, null) ?: ""
+
+    fun setPartyDeviceName(name: String) {
+        prefs.edit().putString(KEY_PARTY_DEVICE_NAME, name).apply()
+    }
+
     private companion object {
         const val KEY_SHUFFLE_STRATEGY = "shuffle_strategy"
         const val KEY_EXCLUDED_FOLDERS = "excluded_folders"
+        const val KEY_PARTY_DEVICE_NAME = "party_device_name"
     }
 }
