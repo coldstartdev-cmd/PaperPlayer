@@ -2,6 +2,7 @@ package com.jp.paperplayer.ui.party
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -209,7 +210,7 @@ private fun ChooserView(
 }
 
 @Composable
-private fun HostView(state: PartyUiState, onEndParty: () -> Unit) {
+private fun ColumnScope.HostView(state: PartyUiState, onEndParty: () -> Unit) {
     Text(
         text = state.partyName,
         style = MaterialTheme.typography.headlineSmall,
