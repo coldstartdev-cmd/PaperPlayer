@@ -47,6 +47,10 @@ object PartyManager {
         guestEngine?.latencyTrimMs = trimMs
     }
 
+    /** Runs acoustic latency calibration on the active guest session. */
+    suspend fun calibrate(): LatencyCalibrator.Result =
+        guestEngine?.calibrate() ?: LatencyCalibrator.Result.Failure("Not in a party")
+
     /** Ends hosting or leaves as guest; resets to the idle state. */
     fun stop() {
         hostEngine?.stop()
