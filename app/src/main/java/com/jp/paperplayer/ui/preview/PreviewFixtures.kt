@@ -3,6 +3,7 @@ package com.jp.paperplayer.ui.preview
 import android.net.Uri
 import com.jp.paperplayer.model.data.LrcTrack
 import com.jp.paperplayer.model.data.LyricLine
+import com.jp.paperplayer.model.data.MusicFolder
 import com.jp.paperplayer.model.data.Song
 import com.jp.paperplayer.model.ui.EditorLine
 import com.jp.paperplayer.model.ui.PlayerState
@@ -42,6 +43,12 @@ internal object PreviewFixtures {
     )
 
     val playCounts = mapOf(1L to 42, 2L to 17, 3L to 5)
+
+    val musicFolders = listOf(
+        MusicFolder("/storage/emulated/0/Music", "Music", 24, excluded = false),
+        MusicFolder("/storage/emulated/0/Download", "Download", 3, excluded = false),
+        MusicFolder("/storage/emulated/0/WhatsApp/Media/WhatsApp Audio", "WhatsApp Audio", 11, excluded = true),
+    )
 
     val editorLines = listOf(
         EditorLine("Waiting in a car", 0L),

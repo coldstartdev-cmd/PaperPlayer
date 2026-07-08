@@ -91,6 +91,7 @@ class MainActivity : ComponentActivity() {
                         composable("settings") {
                             SettingsScreen(
                                 playerViewModel = playerViewModel,
+                                songListViewModel = songListViewModel,
                                 onNavigateBack = { navController.popBackStack() },
                             )
                         }
