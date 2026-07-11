@@ -6,10 +6,7 @@ import android.net.wifi.WifiManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
-import androidx.core.net.toUri
 import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
@@ -23,27 +20,17 @@ import com.jp.paperplayer.model.ui.PartySyncDebug
 import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.model.ui.SyncQuality
 import com.jp.paperplayer.service.PlaybackService
-import java.io.BufferedWriter
-import java.io.File
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.Socket
-import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -66,29 +53,41 @@ class PartyGuestEngine(
     private val wifiLock = (context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
         .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PaperPlayer:partyGuest")
 
-    private var socket: Socket? = null
-    private var writer: BufferedWriter? = null
-    private var hostAddress: String? = null
     private var httpPort: Int = 0
+
+    private val controlChannel = PartyGuestControlChannel(
+        onMessage = ::dispatchMessage,
+        onRejected = { reason -> update { it.copy(isJoining = false, error = reason) } },
+        onJoinFailed = { partyServiceName ->
+            update { it.copy(isJoining = false, error = "Could not join $partyServiceName") }
+        },
+        onDisconnected = ::onDisconnected,
+    )
 
     // HOST_SYNC (in) and SYNC_STATS (out) travel over UDP, not the TCP
     // control socket — see PartyProtocol's doc comment. Persists across a
     // reconnect (same bound local port); re-learned from each WELCOME since
     // the host's UDP port could differ across host sessions.
-    private var udpSocket: DatagramSocket? = null
-    private var hostUdpAddress: InetSocketAddress? = null
-
-    // Auto-reconnect after a dropped connection (WiFi power-save, AP roaming).
-    @Volatile
-    private var leaving = false
-    private var lastParty: DiscoveredParty? = null
-    private var lastDeviceName: String = ""
-    private var reconnectAttempts = 0
+    private val udpChannel = PartyGuestUdpChannel(onHostSync = ::onHostSync)
+    private var udpLocalPort = 0
 
     private var controller: MediaController? = null
-    private var preparedSongId: Long? = null
-    private var preparedFile: File? = null
-    private var preparedSha256: String? = null
+    private val downloadCoordinator = PartyGuestDownloadCoordinator(
+        context = context,
+        scope = scope,
+        downloader = downloader,
+        send = ::send,
+        update = update,
+        getController = { controller },
+        hostAddress = { controlChannel.hostAddress },
+        httpPort = { httpPort },
+        cancelActiveCycles = {
+            pendingStartJob?.cancel()
+            driftJob?.cancel()
+        },
+        runClockSyncRound = { count -> clockSync.runPingRound(count) },
+        latencyTrimMs = { latencyTrimMs },
+    )
 
     // Scheduled-start bookkeeping: the party timeline the drift loop chases.
     private var pendingStartJob: Job? = null
@@ -131,13 +130,7 @@ class PartyGuestEngine(
 
     private val settings = SettingsStore(context)
 
-    /** hostClock - guestClock; null until the first ping round completes. */
-    @Volatile
-    var clockOffsetMs: Long? = null
-        private set
-
-    @Volatile
-    private var lastMedianRttMs = 0L
+    private val clockSync = PartyGuestClockSync(send = ::send, update = update)
 
     /**
      * Manual audio-latency compensation set by the user: positive means this
@@ -163,16 +156,11 @@ class PartyGuestEngine(
         }
     }
 
-    private var pingSeq = 0
-    // Serializes ping rounds: the periodic refresh and a pre-start sync check
-    // must not interleave their samples.
-    private val pingMutex = Mutex()
-    private val pendingSamples = mutableListOf<PingSample>()
-    // Written on the caller's thread (calibrate() hops onto its own IO
-    // context, but the readLoop that delivers the reply is a separate IO
-    // thread) so this needs @Volatile for cross-thread visibility.
-    @Volatile
-    private var pendingCalibration: CompletableDeferred<PartyMessage?>? = null
+    private val calibration = PartyGuestCalibration(
+        context = context,
+        send = ::send,
+        clockOffsetMs = { clockSync.clockOffsetMs },
+    )
 
     fun startDiscovery() {
         update { it.copy(isDiscovering = true, discovered = emptyList(), error = null) }
@@ -200,57 +188,19 @@ class PartyGuestEngine(
     }
 
     fun join(party: DiscoveredParty, deviceName: String) {
-        leaving = false
-        reconnectAttempts = 0
-        lastParty = party
-        lastDeviceName = deviceName
         lastHostSyncAtLocalMs = null
         update { it.copy(isJoining = true, error = null) }
         downloader.cleanup() // purge stale files from a previous crash
         if (!wifiLock.isHeld) wifiLock.acquire()
         connectController()
-        val udp = DatagramSocket(0)
-        udpSocket = udp
-        scope.launch { udpReceiveLoop(udp) }
-        scope.launch {
-            try {
-                val s = Socket()
-                s.connect(InetSocketAddress(party.hostAddress, party.port), CONNECT_TIMEOUT_MS)
-                socket = s
-                hostAddress = party.hostAddress
-                writer = s.getOutputStream().bufferedWriter()
-                send(PartyMessage.Hello(PartyProtocol.VERSION, deviceName, udp.localPort))
-                readLoop(s)
-            } catch (e: Exception) {
-                Log.d(TAG, "Join failed: ${e.message}")
-                update {
-                    it.copy(isJoining = false, error = "Could not join ${party.serviceName}")
-                }
-            }
-        }
+        udpLocalPort = udpChannel.start(scope)
+        controlChannel.connect(party, deviceName, udpLocalPort, scope)
     }
 
     fun leave() {
-        leaving = true
+        controlChannel.leave()
         if (wifiLock.isHeld) wifiLock.release()
-        val s = socket
-        val w = writer
-        socket = null
-        writer = null
-        thread(name = "party-guest-shutdown") {
-            runCatching {
-                if (w != null) {
-                    synchronized(w) {
-                        w.write(PartyMessage.Bye.encode())
-                        w.write("\n")
-                        w.flush()
-                    }
-                }
-            }
-            runCatching { s?.close() }
-        }
-        runCatching { udpSocket?.close() }
-        hostUdpAddress = null
+        udpChannel.stop()
         nsd.stopDiscovery()
         releasePlayback()
         downloader.cleanup()
@@ -261,60 +211,27 @@ class PartyGuestEngine(
 
     // ── Control channel ─────────────────────────────────────────────────────
 
-    private fun readLoop(socket: Socket) {
-        val reader = socket.getInputStream().bufferedReader()
-        try {
-            while (true) {
-                val line = reader.readLine() ?: break
-                when (val message = PartyMessage.parse(line)) {
-                    is PartyMessage.Welcome -> onWelcome(message)
-                    is PartyMessage.Error -> {
-                        update { it.copy(isJoining = false, error = message.reason) }
-                        return
-                    }
-                    is PartyMessage.Pong -> onPong(message)
-                    is PartyMessage.Prepare -> onPrepare(message)
-                    is PartyMessage.SyncCheck -> onSyncCheck(message)
-                    is PartyMessage.Start -> onStart(message)
-                    is PartyMessage.Pause -> onPause(message)
-                    is PartyMessage.Resume -> onResume(message)
-                    is PartyMessage.CalibrateChirp -> pendingCalibration?.complete(message)
-                    is PartyMessage.CalibrateDenied -> pendingCalibration?.complete(message)
-                    is PartyMessage.SetEqRole -> PartyEqController.setRole(message.role)
-                    is PartyMessage.Bye -> break
-                    else -> {}
-                }
-            }
-        } catch (e: Exception) {
-            Log.d(TAG, "Connection lost: ${e.message}")
-        }
-        onDisconnected()
-    }
-
-    /**
-     * Receives HOST_SYNC datagrams. Runs for the life of the party session,
-     * independent of TCP reconnects — a stray datagram from before a
-     * reconnect (or after leave() has already closed the socket) is just a
-     * no-op parse/dispatch once the socket is actually closed.
-     */
-    private fun udpReceiveLoop(socket: DatagramSocket) {
-        val buffer = ByteArray(UDP_BUFFER_SIZE)
-        while (!socket.isClosed) {
-            val packet = DatagramPacket(buffer, buffer.size)
-            try {
-                socket.receive(packet)
-            } catch (e: Exception) {
-                break
-            }
-            val message = PartyMessage.parse(String(packet.data, packet.offset, packet.length, Charsets.UTF_8))
-            if (message is PartyMessage.HostSync) onHostSync(message)
+    /** Routes every message [PartyGuestControlChannel] doesn't special-case itself (BYE, ERROR — see its doc comment). */
+    private fun dispatchMessage(message: PartyMessage) {
+        when (message) {
+            is PartyMessage.Welcome -> onWelcome(message)
+            is PartyMessage.Pong -> clockSync.onPong(message)
+            is PartyMessage.Prepare -> downloadCoordinator.onPrepare(message)
+            is PartyMessage.SyncCheck -> downloadCoordinator.onSyncCheck(message)
+            is PartyMessage.Start -> onStart(message)
+            is PartyMessage.Pause -> onPause(message)
+            is PartyMessage.Resume -> onResume(message)
+            is PartyMessage.CalibrateChirp -> calibration.onReply(message)
+            is PartyMessage.CalibrateDenied -> calibration.onReply(message)
+            is PartyMessage.SetEqRole -> PartyEqController.setRole(message.role)
+            else -> {}
         }
     }
 
     private fun onWelcome(welcome: PartyMessage.Welcome) {
         httpPort = welcome.httpPort
-        reconnectAttempts = 0
-        hostAddress?.let { hostUdpAddress = InetSocketAddress(InetAddress.getByName(it), welcome.udpPort) }
+        controlChannel.resetReconnectAttempts()
+        controlChannel.hostAddress?.let { udpChannel.setHostEndpoint(InetSocketAddress(InetAddress.getByName(it), welcome.udpPort)) }
         stopDiscovery()
         update {
             it.copy(
@@ -326,78 +243,13 @@ class PartyGuestEngine(
                 error = null,
             )
         }
-        scope.launch { pingRounds() }
+        clockSync.start(scope)
     }
 
     // ── Playback ────────────────────────────────────────────────────────────
 
-    private fun onPrepare(prepare: PartyMessage.Prepare) {
-        val host = hostAddress ?: return
-        pendingStartJob?.cancel()
-        driftJob?.cancel()
-        update {
-            it.copy(
-                isDownloading = true,
-                nowPlaying = "${prepare.title} — ${prepare.artist}",
-                startsInMs = null,
-            )
-        }
-        scope.launch {
-            try {
-                val url = "http://$host:$httpPort/song/${prepare.songId}"
-                val file = downloader.download(url, prepare.songId, prepare.ext, prepare.sizeBytes, prepare.sha256)
-                preparedSongId = prepare.songId
-                preparedFile = file
-                preparedSha256 = prepare.sha256
-                withContext(Dispatchers.Main) {
-                    val c = controller ?: return@withContext
-                    c.pause()
-                    c.setPlaybackParameters(PlaybackParameters.DEFAULT)
-                    c.setMediaItem(buildPartyMediaItem(prepare, file))
-                    c.prepare()
-                }
-                update { it.copy(isDownloading = false) }
-                send(PartyMessage.Ready(prepare.songId))
-            } catch (e: Exception) {
-                Log.w(TAG, "Prepare failed for ${prepare.songId}: ${e.message}")
-                update { it.copy(isDownloading = false, error = "Could not download ${prepare.title}") }
-            }
-        }
-    }
-
-    /**
-     * Pre-start checklist, run every time the host is about to start playback:
-     * verify the prepared file still matches the host's hash, re-measure the
-     * clock offset with a fresh ping round, park the player at the start
-     * position, then ack. A failed file check makes the host re-send the file.
-     */
-    private fun onSyncCheck(check: PartyMessage.SyncCheck) {
-        pendingStartJob?.cancel()
-        driftJob?.cancel()
-        update { it.copy(startsInMs = null) }
-        scope.launch {
-            val fileOk = check.songId == preparedSongId &&
-                preparedFile?.exists() == true &&
-                (check.sha256.isEmpty() || check.sha256 == preparedSha256)
-            if (!fileOk) {
-                Log.w(TAG, "Sync check failed for ${check.songId} — asking for the file again")
-                runCatching { send(PartyMessage.SyncReady(check.songId, false, "file missing or stale")) }
-                return@launch
-            }
-            runPingRound(ClockSync.REFRESH_PING_COUNT)
-            withContext(Dispatchers.Main) {
-                controller?.let { c ->
-                    c.setPlaybackParameters(PlaybackParameters.DEFAULT)
-                    c.pause()
-                    c.seekTo(check.positionMs + latencyTrimMs)
-                }
-            }
-            runCatching { send(PartyMessage.SyncReady(check.songId, true, "")) }
-        }
-    }
-
     private fun onStart(start: PartyMessage.Start) {
-        if (start.songId != preparedSongId) return
+        if (start.songId != downloadCoordinator.preparedSongId) return
         schedulePlay(start.positionMs, start.atHostElapsedMs)
         update { it.copy(error = null) }
     }
@@ -419,26 +271,6 @@ class PartyGuestEngine(
     }
 
     /**
-     * A brand-new join (or a reconnect after a fresh process start) can have
-     * its cached file pass the download/hash check almost instantly, so the
-     * host's late-join START can arrive before the very first ping round
-     * (JOIN_PING_COUNT samples, ~1.7s) has produced a clock offset. Falling
-     * back to an offset of 0 would treat the host's elapsedRealtime as if it
-     * were this device's own — elapsedRealtime is boot-relative, so the two
-     * can differ by any amount, and the guest ends up targeting a garbage
-     * instant (never starts, or seeks somewhere nonsensical). Wait briefly
-     * for the in-flight ping round instead.
-     */
-    private suspend fun awaitClockOffset(): Long {
-        clockOffsetMs?.let { return it }
-        val deadline = SystemClock.elapsedRealtime() + CLOCK_OFFSET_WAIT_TIMEOUT_MS
-        while (clockOffsetMs == null && SystemClock.elapsedRealtime() < deadline) {
-            delay(50L)
-        }
-        return clockOffsetMs ?: 0L
-    }
-
-    /**
      * Starts playback of [positionMs] exactly when this device's clock reaches
      * the host instant [atHostElapsedMs] (converted via the measured offset).
      * If the moment already passed — slow download, late join — starts
@@ -454,7 +286,7 @@ class PartyGuestEngine(
         lastHostSyncAtLocalMs = null
         lastHostSyncHostElapsedMs = Long.MIN_VALUE
         pendingStartJob = scope.launch {
-            val offset = awaitClockOffset()
+            val offset = clockSync.awaitOffset()
             val localTarget = atHostElapsedMs - offset
             // Tick the countdown down to the last ~150ms, then hand over to the
             // precise start below.
@@ -604,16 +436,16 @@ class PartyGuestEngine(
                     // sign of exactly that, distinct from genuine audio drift.
                     val stats = PartyMessage.SyncStats(
                         deviceAtMs = nowLocal,
-                        hostAtMs = nowLocal + (clockOffsetMs ?: 0L),
+                        hostAtMs = nowLocal + (clockSync.clockOffsetMs ?: 0L),
                         expectedPositionMs = expected,
                         actualPositionMs = actual,
-                        rttMs = lastMedianRttMs,
+                        rttMs = clockSync.lastMedianRttMs,
                         playbackSpeed = currentSpeed,
                         seekCorrections = seekCount,
                         nudgeCorrections = nudgeCount,
                         latencyTrimMs = latencyTrimMs,
                     )
-                    scope.launch { sendUdp(stats) }
+                    udpChannel.sendAsync(stats, scope)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -640,21 +472,6 @@ class PartyGuestEngine(
             controller.setPlaybackParameters(PlaybackParameters(speed))
         }
     }
-
-    private fun buildPartyMediaItem(prepare: PartyMessage.Prepare, file: File): MediaItem =
-        MediaItem.Builder()
-            .setUri(file.toUri())
-            // Non-numeric media id: keeps guest play counts clean and the
-            // MiniPlayer hidden (it resolves songs via mediaId.toLongOrNull()).
-            .setMediaId("party:${prepare.songId}")
-            .setMediaMetadata(
-                MediaMetadata.Builder()
-                    .setTitle(prepare.title)
-                    .setArtist(prepare.artist)
-                    .setAlbumTitle(prepare.album)
-                    .build()
-            )
-            .build()
 
     private fun connectController() {
         if (controller != null) return
@@ -707,7 +524,7 @@ class PartyGuestEngine(
         controller?.let { c ->
             ContextCompat.getMainExecutor(context).execute {
                 // Only silence playback we started; leave the host's own music alone.
-                if (preparedSongId != null) {
+                if (downloadCoordinator.preparedSongId != null) {
                     runCatching {
                         c.pause()
                         c.clearMediaItems()
@@ -718,225 +535,55 @@ class PartyGuestEngine(
             }
         }
         controller = null
-        preparedSongId = null
-        preparedFile = null
-        preparedSha256 = null
+        downloadCoordinator.clearPrepared()
     }
 
     /**
-     * Runs the acoustic latency calibration once per [Chirp.BANDS] frequency
-     * band and takes the median of the successful measurements. A single
-     * band's chirp pair can get thrown off by a speaker/mic resonance or
-     * ambient noise sitting right in that band; sweeping several bands and
-     * combining them makes the result robust to any one bad measurement.
-     * Returns the median trim if at least one band succeeded, otherwise the
-     * last failure's reason. Caller must already hold RECORD_AUDIO.
+     * Runs the acoustic latency calibration; delegates to [PartyGuestCalibration]
+     * so this stays a stable one-line entry point for [PartyManager.calibrate].
+     * Caller must already hold RECORD_AUDIO.
      */
     suspend fun calibrate(onProgress: (String) -> Unit = {}): LatencyCalibrator.Result =
-        withContext(Dispatchers.IO) {
-            val results = Chirp.BANDS.mapIndexed { index, band ->
-                onProgress("Listening… hold the devices together (${index + 1}/${Chirp.BANDS.size})")
-                val result = calibrateBand(index, band)
-                when (result) {
-                    is LatencyCalibrator.Result.Success ->
-                        Log.d(TAG, "Band $band -> ${result.trimMs}ms")
-                    is LatencyCalibrator.Result.Failure ->
-                        Log.d(TAG, "Band $band -> failed: ${result.reason}")
-                }
-                result
-            }
-            val trims = results.filterIsInstance<LatencyCalibrator.Result.Success>().map { it.trimMs }
-            if (trims.isEmpty()) {
-                val reason = results.filterIsInstance<LatencyCalibrator.Result.Failure>()
-                    .lastOrNull()?.reason ?: "Calibration failed — try again"
-                Log.d(TAG, "Calibration: 0/${results.size} bands succeeded")
-                LatencyCalibrator.Result.Failure(reason)
-            } else {
-                val median = median(trims)
-                Log.d(TAG, "Calibration: $trims -> median ${median}ms (${trims.size}/${results.size} bands succeeded)")
-                LatencyCalibrator.Result.Success(median)
-            }
-        }
-
-    /**
-     * One request/chirp/measure round for a single frequency band.
-     *
-     * Called from [calibrate], which already runs on this engine's IO scope,
-     * unlike everything else here which is dispatched onto it explicitly —
-     * so this can touch the socket directly. Blocking socket I/O on Main
-     * throws NetworkOnMainThreadException, which was getting silently
-     * swallowed by the runCatching around send(), meaning the request never
-     * actually left the device.
-     */
-    private suspend fun calibrateBand(bandIndex: Int, band: Chirp.Band): LatencyCalibrator.Result {
-        val deferred = CompletableDeferred<PartyMessage?>()
-        pendingCalibration = deferred
-        runCatching { send(PartyMessage.CalibrateRequest(bandIndex)) }
-            .onFailure { Log.w(TAG, "Calibrate request failed to send: ${it.message}") }
-        val reply = withTimeoutOrNull(CALIBRATE_REPLY_TIMEOUT_MS) { deferred.await() }
-        pendingCalibration = null
-        return when (reply) {
-            is PartyMessage.CalibrateChirp -> {
-                val offset = clockOffsetMs ?: 0L
-                val hostChirpLocal = reply.atHostElapsedMs - offset
-                val result = LatencyCalibrator(context).measure(
-                    hostChirpAtLocalMs = hostChirpLocal,
-                    ownChirpAtLocalMs = hostChirpLocal + Chirp.OWN_CHIRP_DELAY_MS,
-                    band = band,
-                )
-                // Tell the host this round is actually done — it's waiting on
-                // this instead of guessing our timing, so the next band's
-                // request doesn't get denied as "still busy".
-                runCatching { send(PartyMessage.CalibrateComplete(bandIndex)) }
-                result
-            }
-            is PartyMessage.CalibrateDenied -> LatencyCalibrator.Result.Failure(reply.reason)
-            else -> LatencyCalibrator.Result.Failure("The host didn't respond — try again")
-        }
-    }
-
-    private fun median(values: List<Long>): Long {
-        val sorted = values.sorted()
-        val mid = sorted.size / 2
-        return if (sorted.size % 2 == 1) sorted[mid] else (sorted[mid - 1] + sorted[mid]) / 2
-    }
-
-    // ── Clock sync ──────────────────────────────────────────────────────────
-
-    private suspend fun pingRounds() {
-        runPingRound(ClockSync.JOIN_PING_COUNT)
-        while (true) {
-            delay(OFFSET_REFRESH_INTERVAL_MS)
-            runPingRound(ClockSync.REFRESH_PING_COUNT)
-        }
-    }
-
-    private suspend fun runPingRound(count: Int) = pingMutex.withLock {
-        synchronized(pendingSamples) { pendingSamples.clear() }
-        repeat(count) {
-            runCatching { send(PartyMessage.Ping(++pingSeq, SystemClock.elapsedRealtime())) }
-            delay(ClockSync.PING_INTERVAL_MS)
-        }
-        // Grace period for the last replies to arrive.
-        delay(500L)
-        val samples = synchronized(pendingSamples) { pendingSamples.toList() }
-        if (samples.isEmpty()) return
-        clockOffsetMs = ClockSync.estimateOffsetMs(samples)
-        val quality = if (ClockSync.isQualityPoor(samples)) SyncQuality.POOR else SyncQuality.GOOD
-        val medianRtt = ClockSync.medianRttMs(samples)
-        lastMedianRttMs = medianRtt ?: 0L
-        update {
-            it.copy(
-                syncQuality = quality,
-                rttMs = medianRtt,
-                syncDebug = it.syncDebug.copy(clockOffsetMs = clockOffsetMs, medianRttMs = medianRtt),
-            )
-        }
-    }
-
-    private fun onPong(pong: PartyMessage.Pong) {
-        val sample = PingSample(t0 = pong.t0, t1 = pong.t1, t2 = SystemClock.elapsedRealtime())
-        synchronized(pendingSamples) { pendingSamples.add(sample) }
-    }
+        calibration.calibrate(onProgress)
 
     /** The host's live position, relayed every drift tick; the drift loop chases this directly. */
     private fun onHostSync(sync: PartyMessage.HostSync) {
         if (sync.atHostElapsedMs <= lastHostSyncHostElapsedMs) return
-        val offset = clockOffsetMs ?: return
+        val offset = clockSync.clockOffsetMs ?: return
         lastHostSyncHostElapsedMs = sync.atHostElapsedMs
         lastHostSyncAtLocalMs = sync.atHostElapsedMs - offset
         lastHostSyncPositionMs = sync.positionMs
     }
 
-    private fun onDisconnected() {
-        runCatching { socket?.close() }
-        socket = null
-        writer = null
+    /**
+     * [willRetry] reflects whether [PartyGuestControlChannel] has already
+     * scheduled a reconnect attempt — this only handles the parts that
+     * aren't the channel's concern: playback-core job cancellation, pausing
+     * the player, and the UI-facing error text (worded differently for
+     * "still trying" vs "gave up").
+     */
+    private fun onDisconnected(willRetry: Boolean) {
         pendingStartJob?.cancel()
         driftJob?.cancel()
         scope.launch(Dispatchers.Main) { controller?.pause() }
-        val party = lastParty
-        if (!leaving && party != null && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-            reconnectAttempts++
-            update {
-                if (it.role == PartyRole.GUEST) {
-                    it.copy(error = "Connection lost — reconnecting…", isDownloading = false, startsInMs = null)
-                } else it
-            }
-            attemptReconnect(party)
-            return
-        }
         update {
-            if (it.role == PartyRole.GUEST) {
-                it.copy(error = "Lost connection to the party", isDownloading = false, startsInMs = null)
-            } else {
-                it.copy(isJoining = false)
-            }
-        }
-    }
-
-    /**
-     * Rejoins the last host after a dropped connection. The host treats us as
-     * a fresh late joiner: WELCOME, then the current song's PREPARE — the
-     * cached download passes the hash check, so READY is near-instant and the
-     * host's catch-up START drops us back into the running song in sync.
-     */
-    private fun attemptReconnect(party: DiscoveredParty) {
-        scope.launch {
-            delay(RECONNECT_DELAY_MS)
-            if (leaving) return@launch
-            Log.d(TAG, "Reconnect attempt $reconnectAttempts to ${party.hostAddress}")
-            try {
-                val s = Socket()
-                s.connect(InetSocketAddress(party.hostAddress, party.port), CONNECT_TIMEOUT_MS)
-                socket = s
-                hostAddress = party.hostAddress
-                writer = s.getOutputStream().bufferedWriter()
-                send(PartyMessage.Hello(PartyProtocol.VERSION, lastDeviceName, udpSocket?.localPort ?: 0))
-                readLoop(s)
-            } catch (e: Exception) {
-                Log.d(TAG, "Reconnect failed: ${e.message}")
-                onDisconnected() // schedules the next attempt or gives up
+            when {
+                it.role == PartyRole.GUEST && willRetry ->
+                    it.copy(error = "Connection lost — reconnecting…", isDownloading = false, startsInMs = null)
+                it.role == PartyRole.GUEST ->
+                    it.copy(error = "Lost connection to the party", isDownloading = false, startsInMs = null)
+                willRetry -> it
+                else -> it.copy(isJoining = false)
             }
         }
     }
 
     private fun send(message: PartyMessage) {
-        val w = writer ?: return
-        synchronized(w) {
-            w.write(message.encode())
-            w.write("\n")
-            w.flush()
-        }
-    }
-
-    /**
-     * Fire-and-forget, sent [UDP_SEND_REDUNDANCY] times: UDP has no
-     * retransmission, so a lost SYNC_STATS is just gone. A cheap duplicate
-     * send roughly squares the effective loss probability for the tick.
-     */
-    private fun sendUdp(message: PartyMessage) {
-        val socket = udpSocket ?: return
-        val endpoint = hostUdpAddress ?: return
-        val bytes = message.encode().toByteArray(Charsets.UTF_8)
-        repeat(UDP_SEND_REDUNDANCY) {
-            runCatching { socket.send(DatagramPacket(bytes, bytes.size, endpoint)) }
-        }
+        controlChannel.send(message)
     }
 
     private companion object {
         const val TAG = "PartyGuestEngine"
-        const val CONNECT_TIMEOUT_MS = 5_000
-        const val OFFSET_REFRESH_INTERVAL_MS = 30_000L
-
-        /** Generous for a small JSON payload (HOST_SYNC/SYNC_STATS are well under 300 bytes). */
-        const val UDP_BUFFER_SIZE = 2048
-
-        /** Duplicate sends per SYNC_STATS tick — UDP has no retransmission, so this is the cheap substitute. */
-        const val UDP_SEND_REDUNDANCY = 2
-
-        /** Ceiling for schedulePlay to wait for the in-flight join ping round (~1.7s worst case). */
-        const val CLOCK_OFFSET_WAIT_TIMEOUT_MS = 3_000L
 
         /** Small lead added to corrective seeks to cover the seek latency itself. */
         const val SEEK_LEAD_MS = 60L
@@ -959,11 +606,6 @@ class PartyGuestEngine(
 
         /** Speed is pinned to 1x once this close to the track's natural end — see the Sonic crash comment above. */
         const val END_OF_TRACK_SETTLE_MS = 2_000L
-
-        /** Reconnect every few seconds for ~2 minutes before giving up. */
-        const val RECONNECT_DELAY_MS = 3_000L
-        const val MAX_RECONNECT_ATTEMPTS = 40
-        const val CALIBRATE_REPLY_TIMEOUT_MS = 5_000L
 
         /** Player-error recovery: retries within this window count toward the cap below. */
         const val ERROR_WINDOW_MS = 10_000L

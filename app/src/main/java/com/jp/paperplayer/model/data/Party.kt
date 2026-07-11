@@ -9,7 +9,7 @@ data class DiscoveredParty(
     val port: Int,
 )
 
-enum class PartyMemberStatus { JOINING, SYNCING, DOWNLOADING, READY, PLAYING, LOST }
+enum class PartyMemberStatus { JOINING, SYNCING, DOWNLOADING, READY, PLAYING }
 
 /**
  * At-a-glance sync health, derived from a member's drift history rather than
