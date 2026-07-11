@@ -22,8 +22,6 @@ import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.service.PlaybackService
 import java.io.BufferedReader
 import java.io.BufferedWriter
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -70,13 +68,11 @@ class PartyHostEngine(
     }
 
     private var serverSocket: ServerSocket? = null
-    private var udpSocket: DatagramSocket? = null
-    // HOST_SYNC (out) and SYNC_STATS (in) travel over UDP, not the TCP
-    // control socket — a missed tick is superseded by the next one 500ms
-    // later, so it's not worth a dropped packet head-of-line-blocking
-    // whatever else is queued on the TCP stream. Keyed by memberId, matching
-    // each guest's UDP-listening endpoint as announced in its HELLO.
-    private val udpEndpoints = mutableMapOf<String, InetSocketAddress>()
+    private var udpLocalPort = 0
+    private val udpChannel = PartyHostUdpChannel { memberId, stats, receivedAtHostMs ->
+        val client = synchronized(clients) { clients[memberId] } ?: return@PartyHostUdpChannel
+        onSyncStats(client, stats, receivedAtHostMs)
+    }
     private val clients = mutableMapOf<String, ClientConnection>()
     private val statuses = mutableMapOf<String, PartyMemberStatus>()
     private val memberStats = mutableMapOf<String, PartyMemberSyncStats>()
@@ -234,8 +230,6 @@ class PartyHostEngine(
         this.hostDeviceName = hostDeviceName
         val server = ServerSocket(0)
         serverSocket = server
-        val udp = DatagramSocket(0)
-        udpSocket = udp
         if (!wifiLock.isHeld) wifiLock.acquire()
         fileServer.start(SOCKET_READ_TIMEOUT_MS, false)
         nsd.registerService(partyName, server.localPort) { message ->
@@ -246,7 +240,7 @@ class PartyHostEngine(
             it.copy(role = PartyRole.HOST, partyName = partyName, members = emptyList(), error = null)
         }
         scope.launch { acceptLoop(server) }
-        scope.launch { udpReceiveLoop(udp) }
+        udpLocalPort = udpChannel.start(scope)
     }
 
     /** Assigns [role] to one guest for the bass/mid/treble party trick; NONE turns it off. */
@@ -261,7 +255,7 @@ class PartyHostEngine(
         if (wifiLock.isHeld) wifiLock.release()
         val snapshot = synchronized(clients) { clients.values.toList().also { clients.clear() } }
         synchronized(statuses) { statuses.clear() }
-        synchronized(udpEndpoints) { udpEndpoints.clear() }
+        udpChannel.clearEndpoints()
         synchronized(eqRoles) { eqRoles.clear() }
         PartyEqController.setRole(PartyEqRole.NONE)
         nsd.unregisterService()
@@ -280,7 +274,7 @@ class PartyHostEngine(
                 runCatching { client.socket.close() }
             }
             runCatching { serverSocket?.close() }
-            runCatching { udpSocket?.close() }
+            udpChannel.stop()
             runCatching { fileServer.stop() }
         }
         scope.cancel()
@@ -297,32 +291,6 @@ class PartyHostEngine(
                 break
             }
             scope.launch { handleClient(socket) }
-        }
-    }
-
-    /**
-     * Receives SYNC_STATS datagrams and routes each to the guest it came
-     * from, matched by the (address, port) it announced in HELLO — UDP is
-     * connectionless, so there's no socket to key off like the TCP side has.
-     * A datagram from an address we don't recognize (guest hasn't finished
-     * HELLO/WELCOME yet, or already left) is silently dropped.
-     */
-    private fun udpReceiveLoop(socket: DatagramSocket) {
-        val buffer = ByteArray(UDP_BUFFER_SIZE)
-        while (!socket.isClosed) {
-            val packet = DatagramPacket(buffer, buffer.size)
-            try {
-                socket.receive(packet)
-            } catch (e: Exception) {
-                break
-            }
-            val receivedAtHostMs = SystemClock.elapsedRealtime()
-            val message = PartyMessage.parse(String(packet.data, packet.offset, packet.length, Charsets.UTF_8))
-            if (message !is PartyMessage.SyncStats) continue
-            val sender = InetSocketAddress(packet.address, packet.port)
-            val memberId = synchronized(udpEndpoints) { udpEndpoints.entries.find { it.value == sender }?.key } ?: continue
-            val client = synchronized(clients) { clients[memberId] } ?: continue
-            onSyncStats(client, message, receivedAtHostMs)
         }
     }
 
@@ -348,9 +316,7 @@ class PartyHostEngine(
             // so datagrams from it arrive from (its IP, that port) — the same
             // pair we can build right now from the already-connected TCP
             // socket plus what it told us.
-            synchronized(udpEndpoints) {
-                udpEndpoints[memberId] = InetSocketAddress(socket.inetAddress, hello.udpPort)
-            }
+            udpChannel.registerEndpoint(memberId, InetSocketAddress(socket.inetAddress, hello.udpPort))
             client.send(
                 PartyMessage.Welcome(
                     protocolVersion = PartyProtocol.VERSION,
@@ -358,7 +324,7 @@ class PartyHostEngine(
                     hostName = hostDeviceName,
                     httpPort = fileServer.listeningPort,
                     memberId = memberId,
-                    udpPort = udpSocket?.localPort ?: 0,
+                    udpPort = udpLocalPort,
                 )
             )
             publishMembers()
@@ -387,7 +353,7 @@ class PartyHostEngine(
             synchronized(clients) { awaitingReady.remove(memberId) }
             synchronized(clients) { singleClientSyncAcks.remove(memberId)?.complete(false) }
             synchronized(lastStartedAtMs) { lastStartedAtMs.remove(memberId) }
-            synchronized(udpEndpoints) { udpEndpoints.remove(memberId) }
+            udpChannel.removeEndpoint(memberId)
             synchronized(eqRoles) { eqRoles.remove(memberId) }
             runCatching { socket.close() }
             publishMembers()
@@ -956,11 +922,12 @@ class PartyHostEngine(
                     val drift = c.currentPosition - expected
                     lastKnownHostPositionMs = c.currentPosition
                     lastKnownHostSampleAtMs = nowHost
-                    broadcastUdpAsync(
+                    udpChannel.broadcastAsync(
                         PartyMessage.HostSync(
                             atHostElapsedMs = nowHost,
                             positionMs = c.currentPosition,
-                        )
+                        ),
+                        scope,
                     )
                     // The host's own row on the sync dashboard — informational
                     // only; it's never acted on since the host doesn't self-correct.
@@ -1013,28 +980,6 @@ class PartyHostEngine(
         scope.launch { broadcast(message) }
     }
 
-    /**
-     * Sends each datagram [UDP_SEND_REDUNDANCY] times: unlike the TCP
-     * control socket, UDP has no retransmission, so a single lost HOST_SYNC
-     * is just gone. A cheap duplicate send roughly squares the effective
-     * loss probability for the tick at negligible bandwidth cost (these
-     * payloads are well under 300 bytes).
-     */
-    private fun broadcastUdp(message: PartyMessage) {
-        val socket = udpSocket ?: return
-        val endpoints = synchronized(udpEndpoints) { udpEndpoints.values.toList() }
-        val bytes = message.encode().toByteArray(Charsets.UTF_8)
-        endpoints.forEach { endpoint ->
-            repeat(UDP_SEND_REDUNDANCY) {
-                runCatching { socket.send(DatagramPacket(bytes, bytes.size, endpoint)) }
-            }
-        }
-    }
-
-    private fun broadcastUdpAsync(message: PartyMessage) {
-        scope.launch { broadcastUdp(message) }
-    }
-
     private fun setStatus(memberId: String, status: PartyMemberStatus) {
         synchronized(statuses) { statuses[memberId] = status }
         publishMembers()
@@ -1065,12 +1010,6 @@ class PartyHostEngine(
     private companion object {
         const val TAG = "PartyHostEngine"
         const val READY_TIMEOUT_MS = 15_000L
-
-        /** Generous for a small JSON payload (HOST_SYNC/SYNC_STATS are well under 300 bytes). */
-        const val UDP_BUFFER_SIZE = 2048
-
-        /** Duplicate sends per HOST_SYNC tick — UDP has no retransmission, so this is the cheap substitute. */
-        const val UDP_SEND_REDUNDANCY = 2
 
         /**
          * Ceiling for the pre-start checklist (ping round is ~1s; the slack is
