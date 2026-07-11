@@ -15,8 +15,6 @@ import androidx.media3.session.SessionToken
 import com.jp.paperplayer.model.data.PartyEqRole
 import com.jp.paperplayer.model.data.PartyMember
 import com.jp.paperplayer.model.data.PartyMemberStatus
-import com.jp.paperplayer.model.data.PartyMemberSyncStats
-import com.jp.paperplayer.model.data.SyncHealth
 import com.jp.paperplayer.model.ui.PartyRole
 import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.service.PlaybackService
@@ -38,7 +36,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Runs a party as the host. Advertises via mDNS, accepts guest control
@@ -138,10 +135,7 @@ class PartyHostEngine(
         context = context,
         scope = scope,
         pauseHostPlayback = { if (controller?.playWhenReady == true) controller?.pause() },
-        sendToClient = { memberId, message ->
-            val client = synchronized(clients) { clients[memberId] }
-            if (client != null) runCatching { client.send(message) }
-        },
+        sendToClient = ::sendToClient,
     )
 
     // Out-of-band per-client SYNC_CHECK rounds (auto-resync watchdog), keyed
@@ -150,14 +144,26 @@ class PartyHostEngine(
     // anyone else.
     private val singleClientSyncAcks = mutableMapOf<String, CompletableDeferred<Boolean>>()
 
-    // elapsedRealtime of the last START sent to each guest (party-wide,
-    // late-join, or a targeted resync) — the watchdog won't act again until
-    // RESYNC_GRACE_PERIOD_MS has passed, since every scheduled start has its
-    // own few-second settling transient (host/guest start-latency warm-up,
-    // nudge/seek corrections ramping down) that looks like "worsening" if
-    // judged too early. This doubles as the resync rate limit, since a
-    // resync itself is a start.
-    private val lastStartedAtMs = mutableMapOf<String, Long>()
+    private val resyncWatchdog = PartyHostResyncWatchdog(
+        scope = scope,
+        songCatalog = songCatalog,
+        syncStatsTracker = syncStatsTracker,
+        setStatus = ::setStatus,
+        publishMembers = ::publishMembers,
+        getHostPositionIfPlaying = {
+            withContext(Dispatchers.Main) {
+                if (controller?.playWhenReady == true) controller?.currentPosition else null
+            }
+        },
+        sendToClient = ::sendToClient,
+        isPreparing = { preparing },
+        registerSyncAck = { memberId ->
+            val ack = CompletableDeferred<Boolean>()
+            synchronized(clients) { singleClientSyncAcks[memberId] = ack }
+            ack
+        },
+        clearSyncAck = { memberId -> synchronized(clients) { singleClientSyncAcks.remove(memberId) } },
+    )
 
     private class ClientConnection(
         val memberId: String,
@@ -357,7 +363,7 @@ class PartyHostEngine(
             syncStatsTracker.remove(memberId)
             synchronized(clients) { awaitingReady.remove(memberId) }
             synchronized(clients) { singleClientSyncAcks.remove(memberId)?.complete(false) }
-            synchronized(lastStartedAtMs) { lastStartedAtMs.remove(memberId) }
+            resyncWatchdog.remove(memberId)
             udpChannel.removeEndpoint(memberId)
             runCatching { socket.close() }
             publishMembers()
@@ -383,99 +389,7 @@ class PartyHostEngine(
     private fun onSyncStats(client: ClientConnection, stats: PartyMessage.SyncStats, receivedAtHostMs: Long) {
         val updated = syncStatsTracker.record(client.memberId, client.deviceName, stats, receivedAtHostMs) ?: return
         publishMembers()
-        maybeResync(client, updated)
-    }
-
-    /**
-     * Watchdog: a guest whose recalculated drift trend says it's genuinely
-     * falling out of sync (not a single noisy sample — see [SyncHealth])
-     * gets forced back onto the timeline the same way a late joiner does:
-     * fresh clock offset, pre-seek, scheduled start. Its own incremental
-     * nudge/seek loop may not be enough to recover on its own if the cause
-     * is a stale clock offset or a stuck player.
-     *
-     * Gated on [RESYNC_GRACE_PERIOD_MS] since the guest's last START (party
-     * start, late join, or a previous resync) rather than just on
-     * [SyncHealth]: every scheduled start has its own few-second settling
-     * transient (host/guest start-latency warm-up, nudge/seek corrections
-     * ramping down before they've caught up), and judging that transient too
-     * early reads as "still falling out of sync" — which resyncs again,
-     * which starts a new transient, forever. This was firing resyncs back to
-     * back before the previous settling attempt had a chance to finish.
-     *
-     * Gated on [PartyFeatureFlags.HOST_ASSISTED_RESYNC_ENABLED] — off by
-     * default. The guest's own nudge/seek loop chasing HOST_SYNC is the
-     * proven baseline; this watchdog is a layer on top of it whose accuracy
-     * can only be judged by ear, which made it hard to tune with confidence.
-     */
-    private fun maybeResync(client: ClientConnection, stats: PartyMemberSyncStats) {
-        if (!PartyFeatureFlags.HOST_ASSISTED_RESYNC_ENABLED) return
-        if (stats.syncHealth != SyncHealth.FALLING_OUT_OF_SYNC) return
-        if (preparing) {
-            Log.d(TAG, "${client.deviceName}: FALLING_OUT_OF_SYNC but host is preparing — skipping resync check")
-            return
-        }
-        val songId = currentSongId ?: return
-        val now = SystemClock.elapsedRealtime()
-        val lastStarted = synchronized(lastStartedAtMs) { lastStartedAtMs[client.memberId] }
-        val sinceStart = lastStarted?.let { now - it }
-        if (lastStarted != null && sinceStart!! < RESYNC_GRACE_PERIOD_MS) {
-            Log.d(
-                TAG,
-                "${client.deviceName}: FALLING_OUT_OF_SYNC (verifiedDrift=${stats.verifiedDriftMs}ms) but started " +
-                    "${sinceStart}ms ago, < ${RESYNC_GRACE_PERIOD_MS}ms grace — letting it settle instead of resyncing",
-            )
-            return
-        }
-        syncStatsTracker.incrementResyncCount(client.memberId)
-        publishMembers()
-        Log.i(
-            TAG,
-            "${client.deviceName}: RESYNC #${stats.hostResyncCount + 1} triggered — verifiedDrift=${stats.verifiedDriftMs}ms " +
-                "driftHistory=${stats.driftHistory} sinceLastStart=${sinceStart}ms",
-        )
-        scope.launch { resyncStragglingGuest(client, songId) }
-    }
-
-    /**
-     * Forces one guest back onto the announced timeline: a fresh SYNC_CHECK
-     * (re-measures its clock offset, re-verifies the file, pre-seeks) then a
-     * scheduled START — the same mechanism a late joiner goes through, but
-     * triggered by detecting sustained drift instead of a fresh connection.
-     * Scoped to this one client; the rest of the party, including the host's
-     * own playback, is untouched.
-     */
-    private suspend fun resyncStragglingGuest(client: ClientConnection, songId: Long) {
-        val position = withContext(Dispatchers.Main) {
-            if (controller?.playWhenReady == true) controller?.currentPosition else null
-        } ?: run {
-            Log.w(TAG, "${client.deviceName}: resync aborted — host isn't playing")
-            return
-        }
-        val sha256 = songCatalog.resolve(songId)?.let { songCatalog.sha256(it) } ?: ""
-        setStatus(client.memberId, PartyMemberStatus.SYNCING)
-        val ack = CompletableDeferred<Boolean>()
-        synchronized(clients) { singleClientSyncAcks[client.memberId] = ack }
-        Log.i(TAG, "${client.deviceName}: resync SYNC_CHECK sent, host position=${position}ms")
-        runCatching { client.send(PartyMessage.SyncCheck(songId, sha256, position)) }
-        val ok = withTimeoutOrNull(SYNC_CHECK_TIMEOUT_MS) { ack.await() } ?: false
-        synchronized(clients) { singleClientSyncAcks.remove(client.memberId) }
-        if (!ok) {
-            Log.w(TAG, "${client.deviceName}: resync SYNC_CHECK failed or timed out after ${SYNC_CHECK_TIMEOUT_MS}ms")
-            return
-        }
-        val freshPosition = withContext(Dispatchers.Main) {
-            if (controller?.playWhenReady == true) controller?.currentPosition else null
-        } ?: run {
-            Log.w(TAG, "${client.deviceName}: resync aborted after SYNC_CHECK — host isn't playing")
-            return
-        }
-        val at = SystemClock.elapsedRealtime() + RESUME_LEAD_MS
-        Log.i(TAG, "${client.deviceName}: resync START sent, position=${freshPosition + RESUME_LEAD_MS}ms at host clock $at")
-        runCatching { client.send(PartyMessage.Start(songId, freshPosition + RESUME_LEAD_MS, at)) }
-        syncStatsTracker.clear(client.memberId)
-        markStarted(client.memberId)
-        setStatus(client.memberId, PartyMemberStatus.PLAYING)
+        resyncWatchdog.check(client.memberId, client.deviceName, currentSongId, updated)
     }
 
     private fun onSyncReady(client: ClientConnection, message: PartyMessage.SyncReady) {
@@ -530,7 +444,7 @@ class PartyHostEngine(
                 runCatching {
                     client.send(PartyMessage.Start(songId, position + RESUME_LEAD_MS, at))
                 }
-                markStarted(client.memberId)
+                resyncWatchdog.markStarted(client.memberId)
                 setStatus(client.memberId, PartyMemberStatus.PLAYING)
             }
         }
@@ -663,20 +577,9 @@ class PartyHostEngine(
         Log.i(TAG, "Scheduled start: song $songId at ${positionMs}ms in ${leadMs}ms (host clock $startAt)")
         broadcast(PartyMessage.Start(songId, positionMs, startAt))
         syncStatsTracker.clearAll()
-        markStartedForAll()
+        resyncWatchdog.markStartedForAll(synchronized(clients) { clients.keys.toList() })
         setAllStatuses(PartyMemberStatus.PLAYING)
         hostPlayAt(startAt, positionMs)
-    }
-
-    /** Records that a guest was just sent a START — arms its settling grace period (see [lastStartedAtMs]). */
-    private fun markStarted(memberId: String) {
-        synchronized(lastStartedAtMs) { lastStartedAtMs[memberId] = SystemClock.elapsedRealtime() }
-    }
-
-    private fun markStartedForAll() {
-        val now = SystemClock.elapsedRealtime()
-        val ids = synchronized(clients) { clients.keys.toList() }
-        synchronized(lastStartedAtMs) { ids.forEach { lastStartedAtMs[it] = now } }
     }
 
     private suspend fun awaitReadySet(timeoutMs: Long) {
@@ -800,6 +703,12 @@ class PartyHostEngine(
         scope.launch { broadcast(message) }
     }
 
+    /** Sends to one specific guest by id, swallowing a failure the same way [broadcast] does. */
+    private fun sendToClient(memberId: String, message: PartyMessage) {
+        val client = synchronized(clients) { clients[memberId] } ?: return
+        runCatching { client.send(message) }
+    }
+
     private fun setStatus(memberId: String, status: PartyMemberStatus) {
         rosterStatus.setStatus(memberId, status)
         publishMembers()
@@ -848,16 +757,6 @@ class PartyHostEngine(
         const val DRIFT_CHECK_INTERVAL_MS = 500L
         const val SEEK_LEAD_MS = 60L
         const val DRIFT_HISTORY_SIZE = 60
-
-        /**
-         * How long a guest gets to settle after any START (party start, late
-         * join, or a previous resync) before the watchdog will act on it
-         * again. Set past the ~10-20s natural convergence window observed
-         * for the nudge/seek loop to lock on; shorter than that and the
-         * watchdog catches normal settling mid-flight and mistakes it for a
-         * persistent problem, re-triggering itself indefinitely.
-         */
-        const val RESYNC_GRACE_PERIOD_MS = 20_000L
 
         /** Player-error recovery: retries within this window count toward the cap below. */
         const val ERROR_WINDOW_MS = 10_000L
