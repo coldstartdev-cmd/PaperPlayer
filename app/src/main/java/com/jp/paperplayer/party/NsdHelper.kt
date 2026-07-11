@@ -59,7 +59,7 @@ class NsdHelper(context: Context) {
             override fun onDiscoveryStarted(serviceType: String) {}
 
             override fun onServiceFound(info: NsdServiceInfo) {
-                if (!info.serviceType.startsWith("_paperplayer.")) return
+                if (!info.serviceType.startsWith(SERVICE_TYPE_PREFIX)) return
                 @Suppress("DEPRECATION")
                 nsdManager.resolveService(info, object : NsdManager.ResolveListener {
                     override fun onServiceResolved(resolved: NsdServiceInfo) {
@@ -112,5 +112,13 @@ class NsdHelper(context: Context) {
 
     private companion object {
         const val TAG = "NsdHelper"
+
+        /**
+         * Matched as a prefix rather than the exact [PartyProtocol.SERVICE_TYPE]
+         * since Android's NsdManager can report a resolved subtype/trailing-dot
+         * variation of the advertised type. Derived from the constant (instead
+         * of a hand-duplicated literal) so the two can't silently drift apart.
+         */
+        val SERVICE_TYPE_PREFIX = "${PartyProtocol.SERVICE_TYPE.substringBefore('.')}."
     }
 }
