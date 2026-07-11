@@ -2,16 +2,21 @@ package com.jp.paperplayer.party
 
 import android.content.ComponentName
 import android.content.Context
+import android.net.wifi.WifiManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.jp.paperplayer.model.data.DiscoveredParty
+import com.jp.paperplayer.model.data.PartyEqRole
 import com.jp.paperplayer.data.SettingsStore
 import com.jp.paperplayer.model.ui.PartyRole
 import com.jp.paperplayer.model.ui.PartySyncDebug
@@ -20,10 +25,14 @@ import com.jp.paperplayer.model.ui.SyncQuality
 import com.jp.paperplayer.service.PlaybackService
 import java.io.BufferedWriter
 import java.io.File
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.concurrent.thread
 import kotlin.math.abs
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +42,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -49,14 +60,35 @@ class PartyGuestEngine(
     private val nsd = NsdHelper(context)
     private val downloader = PartyFileDownloader(context)
 
+    // Keeps WiFi awake while in a party; screen-off power save otherwise
+    // drops the control socket mid-song.
+    @Suppress("DEPRECATION")
+    private val wifiLock = (context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
+        .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PaperPlayer:partyGuest")
+
     private var socket: Socket? = null
     private var writer: BufferedWriter? = null
     private var hostAddress: String? = null
     private var httpPort: Int = 0
 
+    // HOST_SYNC (in) and SYNC_STATS (out) travel over UDP, not the TCP
+    // control socket — see PartyProtocol's doc comment. Persists across a
+    // reconnect (same bound local port); re-learned from each WELCOME since
+    // the host's UDP port could differ across host sessions.
+    private var udpSocket: DatagramSocket? = null
+    private var hostUdpAddress: InetSocketAddress? = null
+
+    // Auto-reconnect after a dropped connection (WiFi power-save, AP roaming).
+    @Volatile
+    private var leaving = false
+    private var lastParty: DiscoveredParty? = null
+    private var lastDeviceName: String = ""
+    private var reconnectAttempts = 0
+
     private var controller: MediaController? = null
     private var preparedSongId: Long? = null
     private var preparedFile: File? = null
+    private var preparedSha256: String? = null
 
     // Scheduled-start bookkeeping: the party timeline the drift loop chases.
     private var pendingStartJob: Job? = null
@@ -64,10 +96,48 @@ class PartyGuestEngine(
     private var startPositionMs = 0L
     private var startLocalInstant = 0L
 
+    // The host's own live position, relayed via HOST_SYNC — the drift loop
+    // chases this directly (the host is the reference) instead of the
+    // idealized start-position + elapsed-time formula above, which is only a
+    // fallback until the first sample arrives after a scheduled start.
+    @Volatile
+    private var lastHostSyncAtLocalMs: Long? = null
+    @Volatile
+    private var lastHostSyncPositionMs = 0L
+
+    // The host's elapsedRealtime at the last HOST_SYNC actually applied —
+    // compared against each new packet's own timestamp so a reordered or
+    // duplicate UDP datagram (each tick is sent twice, and UDP doesn't
+    // guarantee order) can't overwrite a newer sample with an older one.
+    // Reset alongside lastHostSyncAtLocalMs in schedulePlay for the same
+    // "belongs to a previous epoch" reason.
+    @Volatile
+    private var lastHostSyncHostElapsedMs = Long.MIN_VALUE
+
+    // ExoPlayer stops for good on a fatal error (decoder hiccup, transient IO
+    // glitch reading the downloaded file) and never retries on its own; the
+    // drift loop keeps ticking through it but never nudges a dead player back
+    // to life, so playback silently goes quiet until the next song or a manual
+    // pause/play. Recover automatically, but stop retrying if it keeps failing.
+    private var errorRecoveryCount = 0
+    private var errorRecoveryWindowStart = 0L
+
+    private val playerListener = object : Player.Listener {
+        override fun onPlayerError(error: PlaybackException) {
+            Log.w(TAG, "Player error: ${error.message}", error)
+            recoverFromPlayerError()
+        }
+    }
+
+    private val settings = SettingsStore(context)
+
     /** hostClock - guestClock; null until the first ping round completes. */
     @Volatile
     var clockOffsetMs: Long? = null
         private set
+
+    @Volatile
+    private var lastMedianRttMs = 0L
 
     /**
      * Manual audio-latency compensation set by the user: positive means this
@@ -75,10 +145,33 @@ class PartyGuestEngine(
      * the party timeline. The drift loop picks up changes within a tick.
      */
     @Volatile
-    var latencyTrimMs: Long = SettingsStore(context).getPartyLatencyTrimMs()
+    var latencyTrimMs: Long = settings.getPartyLatencyTrimMs()
+
+    /**
+     * Where the party should be right now: extrapolated from the host's last
+     * reported real position (HOST_SYNC) when one has arrived, since the host
+     * is the reference every device matches. Falls back to the idealized
+     * start-position + elapsed-time formula for the brief window right after
+     * a scheduled start, before the first host sample lands.
+     */
+    private fun expectedPositionMs(nowLocal: Long): Long {
+        val hostAtLocal = lastHostSyncAtLocalMs
+        return if (hostAtLocal != null) {
+            lastHostSyncPositionMs + (nowLocal - hostAtLocal) + latencyTrimMs
+        } else {
+            startPositionMs + (nowLocal - startLocalInstant) + latencyTrimMs
+        }
+    }
 
     private var pingSeq = 0
+    // Serializes ping rounds: the periodic refresh and a pre-start sync check
+    // must not interleave their samples.
+    private val pingMutex = Mutex()
     private val pendingSamples = mutableListOf<PingSample>()
+    // Written on the caller's thread (calibrate() hops onto its own IO
+    // context, but the readLoop that delivers the reply is a separate IO
+    // thread) so this needs @Volatile for cross-thread visibility.
+    @Volatile
     private var pendingCalibration: CompletableDeferred<PartyMessage?>? = null
 
     fun startDiscovery() {
@@ -107,9 +200,18 @@ class PartyGuestEngine(
     }
 
     fun join(party: DiscoveredParty, deviceName: String) {
+        leaving = false
+        reconnectAttempts = 0
+        lastParty = party
+        lastDeviceName = deviceName
+        lastHostSyncAtLocalMs = null
         update { it.copy(isJoining = true, error = null) }
         downloader.cleanup() // purge stale files from a previous crash
+        if (!wifiLock.isHeld) wifiLock.acquire()
         connectController()
+        val udp = DatagramSocket(0)
+        udpSocket = udp
+        scope.launch { udpReceiveLoop(udp) }
         scope.launch {
             try {
                 val s = Socket()
@@ -117,7 +219,7 @@ class PartyGuestEngine(
                 socket = s
                 hostAddress = party.hostAddress
                 writer = s.getOutputStream().bufferedWriter()
-                send(PartyMessage.Hello(PartyProtocol.VERSION, deviceName))
+                send(PartyMessage.Hello(PartyProtocol.VERSION, deviceName, udp.localPort))
                 readLoop(s)
             } catch (e: Exception) {
                 Log.d(TAG, "Join failed: ${e.message}")
@@ -129,6 +231,8 @@ class PartyGuestEngine(
     }
 
     fun leave() {
+        leaving = true
+        if (wifiLock.isHeld) wifiLock.release()
         val s = socket
         val w = writer
         socket = null
@@ -145,9 +249,12 @@ class PartyGuestEngine(
             }
             runCatching { s?.close() }
         }
+        runCatching { udpSocket?.close() }
+        hostUdpAddress = null
         nsd.stopDiscovery()
         releasePlayback()
         downloader.cleanup()
+        PartyEqController.setRole(PartyEqRole.NONE)
         scope.cancel()
         update { PartyUiState() }
     }
@@ -167,11 +274,13 @@ class PartyGuestEngine(
                     }
                     is PartyMessage.Pong -> onPong(message)
                     is PartyMessage.Prepare -> onPrepare(message)
+                    is PartyMessage.SyncCheck -> onSyncCheck(message)
                     is PartyMessage.Start -> onStart(message)
                     is PartyMessage.Pause -> onPause(message)
                     is PartyMessage.Resume -> onResume(message)
                     is PartyMessage.CalibrateChirp -> pendingCalibration?.complete(message)
                     is PartyMessage.CalibrateDenied -> pendingCalibration?.complete(message)
+                    is PartyMessage.SetEqRole -> PartyEqController.setRole(message.role)
                     is PartyMessage.Bye -> break
                     else -> {}
                 }
@@ -182,8 +291,30 @@ class PartyGuestEngine(
         onDisconnected()
     }
 
+    /**
+     * Receives HOST_SYNC datagrams. Runs for the life of the party session,
+     * independent of TCP reconnects — a stray datagram from before a
+     * reconnect (or after leave() has already closed the socket) is just a
+     * no-op parse/dispatch once the socket is actually closed.
+     */
+    private fun udpReceiveLoop(socket: DatagramSocket) {
+        val buffer = ByteArray(UDP_BUFFER_SIZE)
+        while (!socket.isClosed) {
+            val packet = DatagramPacket(buffer, buffer.size)
+            try {
+                socket.receive(packet)
+            } catch (e: Exception) {
+                break
+            }
+            val message = PartyMessage.parse(String(packet.data, packet.offset, packet.length, Charsets.UTF_8))
+            if (message is PartyMessage.HostSync) onHostSync(message)
+        }
+    }
+
     private fun onWelcome(welcome: PartyMessage.Welcome) {
         httpPort = welcome.httpPort
+        reconnectAttempts = 0
+        hostAddress?.let { hostUdpAddress = InetSocketAddress(InetAddress.getByName(it), welcome.udpPort) }
         stopDiscovery()
         update {
             it.copy(
@@ -214,9 +345,10 @@ class PartyGuestEngine(
         scope.launch {
             try {
                 val url = "http://$host:$httpPort/song/${prepare.songId}"
-                val file = downloader.download(url, prepare.songId, prepare.ext, prepare.sizeBytes)
+                val file = downloader.download(url, prepare.songId, prepare.ext, prepare.sizeBytes, prepare.sha256)
                 preparedSongId = prepare.songId
                 preparedFile = file
+                preparedSha256 = prepare.sha256
                 withContext(Dispatchers.Main) {
                     val c = controller ?: return@withContext
                     c.pause()
@@ -230,6 +362,37 @@ class PartyGuestEngine(
                 Log.w(TAG, "Prepare failed for ${prepare.songId}: ${e.message}")
                 update { it.copy(isDownloading = false, error = "Could not download ${prepare.title}") }
             }
+        }
+    }
+
+    /**
+     * Pre-start checklist, run every time the host is about to start playback:
+     * verify the prepared file still matches the host's hash, re-measure the
+     * clock offset with a fresh ping round, park the player at the start
+     * position, then ack. A failed file check makes the host re-send the file.
+     */
+    private fun onSyncCheck(check: PartyMessage.SyncCheck) {
+        pendingStartJob?.cancel()
+        driftJob?.cancel()
+        update { it.copy(startsInMs = null) }
+        scope.launch {
+            val fileOk = check.songId == preparedSongId &&
+                preparedFile?.exists() == true &&
+                (check.sha256.isEmpty() || check.sha256 == preparedSha256)
+            if (!fileOk) {
+                Log.w(TAG, "Sync check failed for ${check.songId} — asking for the file again")
+                runCatching { send(PartyMessage.SyncReady(check.songId, false, "file missing or stale")) }
+                return@launch
+            }
+            runPingRound(ClockSync.REFRESH_PING_COUNT)
+            withContext(Dispatchers.Main) {
+                controller?.let { c ->
+                    c.setPlaybackParameters(PlaybackParameters.DEFAULT)
+                    c.pause()
+                    c.seekTo(check.positionMs + latencyTrimMs)
+                }
+            }
+            runCatching { send(PartyMessage.SyncReady(check.songId, true, "")) }
         }
     }
 
@@ -256,6 +419,26 @@ class PartyGuestEngine(
     }
 
     /**
+     * A brand-new join (or a reconnect after a fresh process start) can have
+     * its cached file pass the download/hash check almost instantly, so the
+     * host's late-join START can arrive before the very first ping round
+     * (JOIN_PING_COUNT samples, ~1.7s) has produced a clock offset. Falling
+     * back to an offset of 0 would treat the host's elapsedRealtime as if it
+     * were this device's own — elapsedRealtime is boot-relative, so the two
+     * can differ by any amount, and the guest ends up targeting a garbage
+     * instant (never starts, or seeks somewhere nonsensical). Wait briefly
+     * for the in-flight ping round instead.
+     */
+    private suspend fun awaitClockOffset(): Long {
+        clockOffsetMs?.let { return it }
+        val deadline = SystemClock.elapsedRealtime() + CLOCK_OFFSET_WAIT_TIMEOUT_MS
+        while (clockOffsetMs == null && SystemClock.elapsedRealtime() < deadline) {
+            delay(50L)
+        }
+        return clockOffsetMs ?: 0L
+    }
+
+    /**
      * Starts playback of [positionMs] exactly when this device's clock reaches
      * the host instant [atHostElapsedMs] (converted via the measured offset).
      * If the moment already passed — slow download, late join — starts
@@ -264,8 +447,14 @@ class PartyGuestEngine(
     private fun schedulePlay(positionMs: Long, atHostElapsedMs: Long) {
         pendingStartJob?.cancel()
         driftJob?.cancel()
+        errorRecoveryCount = 0
+        // Discard any HOST_SYNC sample from before this start — it belongs to
+        // whatever the party was doing previously and would extrapolate to a
+        // bogus "expected" position until a fresh one lands.
+        lastHostSyncAtLocalMs = null
+        lastHostSyncHostElapsedMs = Long.MIN_VALUE
         pendingStartJob = scope.launch {
-            val offset = clockOffsetMs ?: 0L
+            val offset = awaitClockOffset()
             val localTarget = atHostElapsedMs - offset
             // Tick the countdown down to the last ~150ms, then hand over to the
             // precise start below.
@@ -307,54 +496,148 @@ class PartyGuestEngine(
             var nudging = false
             var seeks = 0
             var nudges = 0
+            var lastAdjustmentAtMs = 0L
             while (true) {
                 delay(DRIFT_CHECK_INTERVAL_MS)
                 val c = controller ?: break
                 if (!c.isPlaying) continue
-                val expected = startPositionMs + (SystemClock.elapsedRealtime() - startLocalInstant) + latencyTrimMs
-                val actual = c.currentPosition
-                val drift = actual - expected
-                var speed = c.playbackParameters.speed
-                when {
-                    abs(drift) > DRIFT_SEEK_THRESHOLD_MS -> {
-                        Log.d(TAG, "Drift ${drift}ms — correcting with seek")
-                        c.setPlaybackParameters(PlaybackParameters.DEFAULT)
-                        nudging = false
-                        seeks++
-                        speed = 1f
-                        c.seekTo(expected + SEEK_LEAD_MS)
+                // An unexpected exception from a single tick (a MediaController
+                // call landing mid-teardown, a transient state inconsistency)
+                // used to kill this whole coroutine silently — sync for the
+                // rest of the song, with no retry and no visible error. One
+                // bad tick shouldn't cost the rest of the song; log it and
+                // pick back up next tick instead. CancellationException must
+                // still propagate, or driftJob.cancel() (called from onPrepare,
+                // onSyncCheck, onPause, schedulePlay, releasePlayback) would
+                // stop actually stopping this loop.
+                try {
+                    val nowLocal = SystemClock.elapsedRealtime()
+                    val expected = expectedPositionMs(nowLocal)
+                    val actual = c.currentPosition
+                    val drift = actual - expected
+                    var speed = c.playbackParameters.speed
+                    // Only large drift (a real, audible problem) gets corrected on
+                    // sight. Nudge/settle changes are throttled to at most once
+                    // per ADJUSTMENT_COOLDOWN_MS: reacting to every single 500ms
+                    // sample meant we'd often change speed again before the
+                    // previous change had time to actually pull drift back in,
+                    // producing constant nudge<->settle flapping (and the
+                    // corresponding IN_SYNC/DRIFTING flicker on the dashboard)
+                    // instead of one adjustment settling before the next.
+                    val onCooldown = nowLocal - lastAdjustmentAtMs < ADJUSTMENT_COOLDOWN_MS
+                    // ExoPlayer's Sonic time-stretch processor has a known
+                    // crash (ArrayIndexOutOfBoundsException in
+                    // Sonic.insertPitchPeriod, from queueEndOfStream) when
+                    // end-of-stream is reached while speed != 1x. Flattening
+                    // speed for the last stretch of the track means the
+                    // stream can never actually end mid-nudge — a couple of
+                    // seconds of unmanaged drift right as the song finishes
+                    // is inaudible anyway, and far cheaper than the crash's
+                    // recovery (a hard re-seek that itself disrupts sync).
+                    val durationMs = c.duration
+                    val remainingMs = if (durationMs == C.TIME_UNSET) Long.MAX_VALUE else durationMs - actual
+                    when {
+                        remainingMs < END_OF_TRACK_SETTLE_MS -> {
+                            setPlaybackSpeed(c, 1f)
+                            nudging = false
+                            speed = 1f
+                        }
+                        abs(drift) > DRIFT_SEEK_THRESHOLD_MS -> {
+                            Log.d(TAG, "Drift ${drift}ms — correcting with seek")
+                            setPlaybackSpeed(c, 1f)
+                            nudging = false
+                            seeks++
+                            speed = 1f
+                            c.seekTo(expected + SEEK_LEAD_MS)
+                            lastAdjustmentAtMs = nowLocal
+                        }
+                        onCooldown -> {
+                            // Hold the last adjustment; let it take effect before
+                            // reacting to a fresher sample.
+                        }
+                        abs(drift) > DRIFT_NUDGE_THRESHOLD_MS -> {
+                            // Gentle nudge inside the coarse band so the frequent
+                            // small corrections stay inaudible.
+                            val gentle = abs(drift) <= DRIFT_COARSE_NUDGE_MS
+                            speed = when {
+                                drift > 0 -> if (gentle) NUDGE_SLOW_FINE else NUDGE_SLOW
+                                else -> if (gentle) NUDGE_FAST_FINE else NUDGE_FAST
+                            }
+                            setPlaybackSpeed(c, speed)
+                            if (!nudging) nudges++
+                            nudging = true
+                            lastAdjustmentAtMs = nowLocal
+                            Log.d(TAG, "Drift ${drift}ms — nudging at ${speed}x")
+                        }
+                        nudging && abs(drift) < DRIFT_SETTLED_MS -> {
+                            setPlaybackSpeed(c, 1f)
+                            nudging = false
+                            speed = 1f
+                            lastAdjustmentAtMs = nowLocal
+                            Log.d(TAG, "Drift settled at ${drift}ms")
+                        }
                     }
-                    abs(drift) > DRIFT_NUDGE_THRESHOLD_MS -> {
-                        speed = if (drift > 0) NUDGE_SLOW else NUDGE_FAST
-                        c.setPlaybackParameters(PlaybackParameters(speed))
-                        if (!nudging) nudges++
-                        nudging = true
-                        Log.d(TAG, "Drift ${drift}ms — nudging at ${speed}x")
-                    }
-                    nudging && abs(drift) < DRIFT_SETTLED_MS -> {
-                        c.setPlaybackParameters(PlaybackParameters.DEFAULT)
-                        nudging = false
-                        speed = 1f
-                        Log.d(TAG, "Drift settled at ${drift}ms")
-                    }
-                }
-                val seekCount = seeks
-                val nudgeCount = nudges
-                val currentSpeed = speed
-                update {
-                    it.copy(
-                        syncDebug = it.syncDebug.copy(
-                            lastDriftMs = drift,
-                            playbackSpeed = currentSpeed,
-                            expectedPositionMs = expected,
-                            actualPositionMs = actual,
-                            seekCorrections = seekCount,
-                            nudgeCorrections = nudgeCount,
-                            driftHistory = (it.syncDebug.driftHistory + drift).takeLast(DRIFT_HISTORY_SIZE),
+                    val seekCount = seeks
+                    val nudgeCount = nudges
+                    val currentSpeed = speed
+                    update {
+                        it.copy(
+                            syncDebug = it.syncDebug.copy(
+                                lastDriftMs = drift,
+                                playbackSpeed = currentSpeed,
+                                expectedPositionMs = expected,
+                                actualPositionMs = actual,
+                                seekCorrections = seekCount,
+                                nudgeCorrections = nudgeCount,
+                                driftHistory = (it.syncDebug.driftHistory + drift).takeLast(DRIFT_HISTORY_SIZE),
+                            )
                         )
+                    }
+                    // Raw telemetry for the host dashboard — the same numbers
+                    // driving this device's own debug panel, not just the
+                    // collapsed drift, so the host can see exactly what this
+                    // guest observed rather than trusting one derived figure.
+                    // hostAtMs lets the host place every guest's sample on its
+                    // own timeline regardless of delivery jitter — including
+                    // WiFi hiccups: a gap between consecutive hostAtMs values
+                    // that's much larger than DRIFT_CHECK_INTERVAL_MS is a direct
+                    // sign of exactly that, distinct from genuine audio drift.
+                    val stats = PartyMessage.SyncStats(
+                        deviceAtMs = nowLocal,
+                        hostAtMs = nowLocal + (clockOffsetMs ?: 0L),
+                        expectedPositionMs = expected,
+                        actualPositionMs = actual,
+                        rttMs = lastMedianRttMs,
+                        playbackSpeed = currentSpeed,
+                        seekCorrections = seekCount,
+                        nudgeCorrections = nudgeCount,
+                        latencyTrimMs = latencyTrimMs,
                     )
+                    scope.launch { sendUdp(stats) }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Drift tick failed, retrying next tick: ${e.message}")
                 }
             }
+        }
+    }
+
+    /**
+     * Only calls setPlaybackParameters when the speed is actually changing.
+     * The nudge loop recomputes its target speed every tick even when it
+     * hasn't moved — there are only a handful of fixed nudge values, not a
+     * continuous function of drift, so the same value routinely gets
+     * recomputed for many consecutive ticks. Reapplying it anyway, every
+     * 500ms for minutes at a stretch, turned out to destabilize ExoPlayer's
+     * Sonic time-stretch processor: real observed crashes
+     * (ArrayIndexOutOfBoundsException in Sonic.insertPitchPeriod) followed
+     * long runs of "nudging at Nx" log lines with an unchanged N. Sonic
+     * isn't built to be reconfigured with the same parameters indefinitely.
+     */
+    private fun setPlaybackSpeed(controller: MediaController, speed: Float) {
+        if (controller.playbackParameters.speed != speed) {
+            controller.setPlaybackParameters(PlaybackParameters(speed))
         }
     }
 
@@ -379,11 +662,43 @@ class PartyGuestEngine(
         val future = MediaController.Builder(context, token).buildAsync()
         future.addListener({
             try {
-                controller = future.get()
+                controller = future.get().also { it.addListener(playerListener) }
             } catch (e: Exception) {
                 Log.w(TAG, "Controller connection failed: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(context))
+    }
+
+    /**
+     * Main thread only. Re-prepares and re-seeks to where the party timeline
+     * should be right now, so a transient player error clears itself instead
+     * of leaving this device silent until the next song. Gives up after a
+     * burst of repeated errors rather than spinning forever on a broken file.
+     */
+    private fun recoverFromPlayerError() {
+        val c = controller ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (now - errorRecoveryWindowStart > ERROR_WINDOW_MS) {
+            errorRecoveryWindowStart = now
+            errorRecoveryCount = 0
+        }
+        errorRecoveryCount++
+        if (errorRecoveryCount > MAX_ERROR_RECOVERIES) {
+            Log.e(TAG, "Giving up after repeated player errors")
+            update { it.copy(error = "Playback error — waiting for the next song") }
+            return
+        }
+        // Reset speed before re-preparing: the crash this most often recovers
+        // from (Sonic's queueEndOfStream ArrayIndexOutOfBoundsException) is
+        // itself triggered by ending a stream while speed != 1x, and the
+        // freshly re-prepared pipeline inherits whatever PlaybackParameters
+        // were last set. Recovering into the same non-1x state risked
+        // immediately re-triggering the same crash on the next tick.
+        c.setPlaybackParameters(PlaybackParameters.DEFAULT)
+        c.prepare()
+        if (driftJob?.isActive == true) {
+            c.seekTo(expectedPositionMs(now) + SEEK_LEAD_MS)
+        }
     }
 
     private fun releasePlayback() {
@@ -398,38 +713,92 @@ class PartyGuestEngine(
                         c.clearMediaItems()
                     }
                 }
+                c.removeListener(playerListener)
                 c.release()
             }
         }
         controller = null
         preparedSongId = null
         preparedFile = null
+        preparedSha256 = null
     }
 
     /**
-     * Runs the acoustic latency calibration: asks the host to chirp, chirps
-     * back 800ms later, and measures the relative output latency from one mic
-     * recording. Returns the measured trim, or a failure with a user-facing
-     * reason. Caller must already hold RECORD_AUDIO.
+     * Runs the acoustic latency calibration once per [Chirp.BANDS] frequency
+     * band and takes the median of the successful measurements. A single
+     * band's chirp pair can get thrown off by a speaker/mic resonance or
+     * ambient noise sitting right in that band; sweeping several bands and
+     * combining them makes the result robust to any one bad measurement.
+     * Returns the median trim if at least one band succeeded, otherwise the
+     * last failure's reason. Caller must already hold RECORD_AUDIO.
      */
-    suspend fun calibrate(): LatencyCalibrator.Result {
+    suspend fun calibrate(onProgress: (String) -> Unit = {}): LatencyCalibrator.Result =
+        withContext(Dispatchers.IO) {
+            val results = Chirp.BANDS.mapIndexed { index, band ->
+                onProgress("Listening… hold the devices together (${index + 1}/${Chirp.BANDS.size})")
+                val result = calibrateBand(index, band)
+                when (result) {
+                    is LatencyCalibrator.Result.Success ->
+                        Log.d(TAG, "Band $band -> ${result.trimMs}ms")
+                    is LatencyCalibrator.Result.Failure ->
+                        Log.d(TAG, "Band $band -> failed: ${result.reason}")
+                }
+                result
+            }
+            val trims = results.filterIsInstance<LatencyCalibrator.Result.Success>().map { it.trimMs }
+            if (trims.isEmpty()) {
+                val reason = results.filterIsInstance<LatencyCalibrator.Result.Failure>()
+                    .lastOrNull()?.reason ?: "Calibration failed — try again"
+                Log.d(TAG, "Calibration: 0/${results.size} bands succeeded")
+                LatencyCalibrator.Result.Failure(reason)
+            } else {
+                val median = median(trims)
+                Log.d(TAG, "Calibration: $trims -> median ${median}ms (${trims.size}/${results.size} bands succeeded)")
+                LatencyCalibrator.Result.Success(median)
+            }
+        }
+
+    /**
+     * One request/chirp/measure round for a single frequency band.
+     *
+     * Called from [calibrate], which already runs on this engine's IO scope,
+     * unlike everything else here which is dispatched onto it explicitly —
+     * so this can touch the socket directly. Blocking socket I/O on Main
+     * throws NetworkOnMainThreadException, which was getting silently
+     * swallowed by the runCatching around send(), meaning the request never
+     * actually left the device.
+     */
+    private suspend fun calibrateBand(bandIndex: Int, band: Chirp.Band): LatencyCalibrator.Result {
         val deferred = CompletableDeferred<PartyMessage?>()
         pendingCalibration = deferred
-        runCatching { send(PartyMessage.CalibrateRequest) }
+        runCatching { send(PartyMessage.CalibrateRequest(bandIndex)) }
+            .onFailure { Log.w(TAG, "Calibrate request failed to send: ${it.message}") }
         val reply = withTimeoutOrNull(CALIBRATE_REPLY_TIMEOUT_MS) { deferred.await() }
         pendingCalibration = null
         return when (reply) {
             is PartyMessage.CalibrateChirp -> {
                 val offset = clockOffsetMs ?: 0L
                 val hostChirpLocal = reply.atHostElapsedMs - offset
-                LatencyCalibrator().measure(
+                val result = LatencyCalibrator(context).measure(
                     hostChirpAtLocalMs = hostChirpLocal,
-                    ownChirpAtLocalMs = hostChirpLocal + OWN_CHIRP_DELAY_MS,
+                    ownChirpAtLocalMs = hostChirpLocal + Chirp.OWN_CHIRP_DELAY_MS,
+                    band = band,
                 )
+                // Tell the host this round is actually done — it's waiting on
+                // this instead of guessing our timing, so the next band's
+                // request doesn't get denied as "still busy".
+                runCatching { send(PartyMessage.CalibrateComplete(bandIndex)) }
+                result
             }
             is PartyMessage.CalibrateDenied -> LatencyCalibrator.Result.Failure(reply.reason)
             else -> LatencyCalibrator.Result.Failure("The host didn't respond — try again")
         }
+    }
+
+    private fun median(values: List<Long>): Long {
+        val sorted = values.sorted()
+        val mid = sorted.size / 2
+        return if (sorted.size % 2 == 1) sorted[mid] else (sorted[mid - 1] + sorted[mid]) / 2
     }
 
     // ── Clock sync ──────────────────────────────────────────────────────────
@@ -442,7 +811,7 @@ class PartyGuestEngine(
         }
     }
 
-    private suspend fun runPingRound(count: Int) {
+    private suspend fun runPingRound(count: Int) = pingMutex.withLock {
         synchronized(pendingSamples) { pendingSamples.clear() }
         repeat(count) {
             runCatching { send(PartyMessage.Ping(++pingSeq, SystemClock.elapsedRealtime())) }
@@ -455,6 +824,7 @@ class PartyGuestEngine(
         clockOffsetMs = ClockSync.estimateOffsetMs(samples)
         val quality = if (ClockSync.isQualityPoor(samples)) SyncQuality.POOR else SyncQuality.GOOD
         val medianRtt = ClockSync.medianRttMs(samples)
+        lastMedianRttMs = medianRtt ?: 0L
         update {
             it.copy(
                 syncQuality = quality,
@@ -469,6 +839,15 @@ class PartyGuestEngine(
         synchronized(pendingSamples) { pendingSamples.add(sample) }
     }
 
+    /** The host's live position, relayed every drift tick; the drift loop chases this directly. */
+    private fun onHostSync(sync: PartyMessage.HostSync) {
+        if (sync.atHostElapsedMs <= lastHostSyncHostElapsedMs) return
+        val offset = clockOffsetMs ?: return
+        lastHostSyncHostElapsedMs = sync.atHostElapsedMs
+        lastHostSyncAtLocalMs = sync.atHostElapsedMs - offset
+        lastHostSyncPositionMs = sync.positionMs
+    }
+
     private fun onDisconnected() {
         runCatching { socket?.close() }
         socket = null
@@ -476,11 +855,48 @@ class PartyGuestEngine(
         pendingStartJob?.cancel()
         driftJob?.cancel()
         scope.launch(Dispatchers.Main) { controller?.pause() }
+        val party = lastParty
+        if (!leaving && party != null && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+            reconnectAttempts++
+            update {
+                if (it.role == PartyRole.GUEST) {
+                    it.copy(error = "Connection lost — reconnecting…", isDownloading = false, startsInMs = null)
+                } else it
+            }
+            attemptReconnect(party)
+            return
+        }
         update {
             if (it.role == PartyRole.GUEST) {
                 it.copy(error = "Lost connection to the party", isDownloading = false, startsInMs = null)
             } else {
                 it.copy(isJoining = false)
+            }
+        }
+    }
+
+    /**
+     * Rejoins the last host after a dropped connection. The host treats us as
+     * a fresh late joiner: WELCOME, then the current song's PREPARE — the
+     * cached download passes the hash check, so READY is near-instant and the
+     * host's catch-up START drops us back into the running song in sync.
+     */
+    private fun attemptReconnect(party: DiscoveredParty) {
+        scope.launch {
+            delay(RECONNECT_DELAY_MS)
+            if (leaving) return@launch
+            Log.d(TAG, "Reconnect attempt $reconnectAttempts to ${party.hostAddress}")
+            try {
+                val s = Socket()
+                s.connect(InetSocketAddress(party.hostAddress, party.port), CONNECT_TIMEOUT_MS)
+                socket = s
+                hostAddress = party.hostAddress
+                writer = s.getOutputStream().bufferedWriter()
+                send(PartyMessage.Hello(PartyProtocol.VERSION, lastDeviceName, udpSocket?.localPort ?: 0))
+                readLoop(s)
+            } catch (e: Exception) {
+                Log.d(TAG, "Reconnect failed: ${e.message}")
+                onDisconnected() // schedules the next attempt or gives up
             }
         }
     }
@@ -494,21 +910,63 @@ class PartyGuestEngine(
         }
     }
 
+    /**
+     * Fire-and-forget, sent [UDP_SEND_REDUNDANCY] times: UDP has no
+     * retransmission, so a lost SYNC_STATS is just gone. A cheap duplicate
+     * send roughly squares the effective loss probability for the tick.
+     */
+    private fun sendUdp(message: PartyMessage) {
+        val socket = udpSocket ?: return
+        val endpoint = hostUdpAddress ?: return
+        val bytes = message.encode().toByteArray(Charsets.UTF_8)
+        repeat(UDP_SEND_REDUNDANCY) {
+            runCatching { socket.send(DatagramPacket(bytes, bytes.size, endpoint)) }
+        }
+    }
+
     private companion object {
         const val TAG = "PartyGuestEngine"
         const val CONNECT_TIMEOUT_MS = 5_000
         const val OFFSET_REFRESH_INTERVAL_MS = 30_000L
 
+        /** Generous for a small JSON payload (HOST_SYNC/SYNC_STATS are well under 300 bytes). */
+        const val UDP_BUFFER_SIZE = 2048
+
+        /** Duplicate sends per SYNC_STATS tick — UDP has no retransmission, so this is the cheap substitute. */
+        const val UDP_SEND_REDUNDANCY = 2
+
+        /** Ceiling for schedulePlay to wait for the in-flight join ping round (~1.7s worst case). */
+        const val CLOCK_OFFSET_WAIT_TIMEOUT_MS = 3_000L
+
         /** Small lead added to corrective seeks to cover the seek latency itself. */
         const val SEEK_LEAD_MS = 60L
+        // Band tuning from listening tests: under ~±10ms devices fuse into one
+        // sound; 15–40ms is audible flam, so the loop must not idle there.
         const val DRIFT_CHECK_INTERVAL_MS = 500L
+        // Nudge/settle changes are throttled to this cadence so each
+        // adjustment has time to land before the next one is judged; large
+        // (seek-worthy) drift always corrects immediately regardless.
+        const val ADJUSTMENT_COOLDOWN_MS = 1_500L
         const val DRIFT_SEEK_THRESHOLD_MS = 150L
-        const val DRIFT_NUDGE_THRESHOLD_MS = 40L
-        const val DRIFT_SETTLED_MS = 15L
+        const val DRIFT_NUDGE_THRESHOLD_MS = 10L
+        const val DRIFT_COARSE_NUDGE_MS = 40L
+        const val DRIFT_SETTLED_MS = 4L
         const val NUDGE_SLOW = 0.975f
         const val NUDGE_FAST = 1.025f
+        const val NUDGE_SLOW_FINE = 0.99f
+        const val NUDGE_FAST_FINE = 1.01f
         const val DRIFT_HISTORY_SIZE = 60
+
+        /** Speed is pinned to 1x once this close to the track's natural end — see the Sonic crash comment above. */
+        const val END_OF_TRACK_SETTLE_MS = 2_000L
+
+        /** Reconnect every few seconds for ~2 minutes before giving up. */
+        const val RECONNECT_DELAY_MS = 3_000L
+        const val MAX_RECONNECT_ATTEMPTS = 40
         const val CALIBRATE_REPLY_TIMEOUT_MS = 5_000L
-        const val OWN_CHIRP_DELAY_MS = 800L
+
+        /** Player-error recovery: retries within this window count toward the cap below. */
+        const val ERROR_WINDOW_MS = 10_000L
+        const val MAX_ERROR_RECOVERIES = 3
     }
 }

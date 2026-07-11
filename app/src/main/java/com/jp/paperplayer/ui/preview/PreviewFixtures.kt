@@ -7,6 +7,7 @@ import com.jp.paperplayer.model.data.LyricLine
 import com.jp.paperplayer.model.data.MusicFolder
 import com.jp.paperplayer.model.data.PartyMember
 import com.jp.paperplayer.model.data.PartyMemberStatus
+import com.jp.paperplayer.model.data.PartyMemberSyncStats
 import com.jp.paperplayer.model.data.Song
 import com.jp.paperplayer.model.ui.EditorLine
 import com.jp.paperplayer.model.ui.PlayerState
@@ -55,6 +56,35 @@ internal object PreviewFixtures {
     val partyMembers = listOf(
         PartyMember("m1", "Galaxy S23", PartyMemberStatus.READY),
         PartyMember("m2", "Redmi Note 12", PartyMemberStatus.SYNCING),
+        PartyMember(
+            "m3", "Pixel 9 Pro XL", PartyMemberStatus.PLAYING,
+            stats = PartyMemberSyncStats(
+                deviceAtMs = 100_000L, hostAtMs = 100_000L - 12L,
+                expectedPositionMs = 63_400L, actualPositionMs = 63_403L, rttMs = 18L, playbackSpeed = 1f,
+                seekCorrections = 1, nudgeCorrections = 6, latencyTrimMs = -70L,
+                driftHistory = List(20) { (it % 5) - 2L },
+            ),
+        ),
+        PartyMember(
+            "m4", "S8 tablet", PartyMemberStatus.PLAYING,
+            stats = PartyMemberSyncStats(
+                deviceAtMs = 100_000L, hostAtMs = 100_000L + 8L,
+                expectedPositionMs = 63_400L, actualPositionMs = 63_434L, rttMs = 22L, playbackSpeed = 0.99f,
+                seekCorrections = 0, nudgeCorrections = 14, latencyTrimMs = -70L,
+                driftHistory = List(20) { 30L + (it % 5) },
+            ),
+        ),
+        PartyMember(
+            "m5", "Old tablet", PartyMemberStatus.PLAYING,
+            stats = PartyMemberSyncStats(
+                deviceAtMs = 100_000L, hostAtMs = 100_000L + 4L,
+                expectedPositionMs = 63_400L, actualPositionMs = 63_457L, rttMs = 40L, playbackSpeed = 1.025f,
+                seekCorrections = 3, nudgeCorrections = 9, latencyTrimMs = 0L,
+                driftHistory = List(20) { i -> if (i < 10) 5L + i else 30L + (i - 10) * 3L },
+                lastSampleGapMs = 1_800L, networkGapCount = 2,
+                hostVerifiedExpectedPositionMs = 63_400L - 25L, hostResyncCount = 1,
+            ),
+        ),
     )
 
     val musicFolders = listOf(
