@@ -31,12 +31,10 @@ import java.net.Socket
 import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -153,11 +151,11 @@ class PartyGuestEngine(
         }
     }
 
-    // Written on the caller's thread (calibrate() hops onto its own IO
-    // context, but the readLoop that delivers the reply is a separate IO
-    // thread) so this needs @Volatile for cross-thread visibility.
-    @Volatile
-    private var pendingCalibration: CompletableDeferred<PartyMessage?>? = null
+    private val calibration = PartyGuestCalibration(
+        context = context,
+        send = ::send,
+        clockOffsetMs = { clockSync.clockOffsetMs },
+    )
 
     fun startDiscovery() {
         update { it.copy(isDiscovering = true, discovered = emptyList(), error = null) }
@@ -260,8 +258,8 @@ class PartyGuestEngine(
                     is PartyMessage.Start -> onStart(message)
                     is PartyMessage.Pause -> onPause(message)
                     is PartyMessage.Resume -> onResume(message)
-                    is PartyMessage.CalibrateChirp -> pendingCalibration?.complete(message)
-                    is PartyMessage.CalibrateDenied -> pendingCalibration?.complete(message)
+                    is PartyMessage.CalibrateChirp -> calibration.onReply(message)
+                    is PartyMessage.CalibrateDenied -> calibration.onReply(message)
                     is PartyMessage.SetEqRole -> PartyEqController.setRole(message.role)
                     is PartyMessage.Bye -> break
                     else -> {}
@@ -666,82 +664,12 @@ class PartyGuestEngine(
     }
 
     /**
-     * Runs the acoustic latency calibration once per [Chirp.BANDS] frequency
-     * band and takes the median of the successful measurements. A single
-     * band's chirp pair can get thrown off by a speaker/mic resonance or
-     * ambient noise sitting right in that band; sweeping several bands and
-     * combining them makes the result robust to any one bad measurement.
-     * Returns the median trim if at least one band succeeded, otherwise the
-     * last failure's reason. Caller must already hold RECORD_AUDIO.
+     * Runs the acoustic latency calibration; delegates to [PartyGuestCalibration]
+     * so this stays a stable one-line entry point for [PartyManager.calibrate].
+     * Caller must already hold RECORD_AUDIO.
      */
     suspend fun calibrate(onProgress: (String) -> Unit = {}): LatencyCalibrator.Result =
-        withContext(Dispatchers.IO) {
-            val results = Chirp.BANDS.mapIndexed { index, band ->
-                onProgress("Listening… hold the devices together (${index + 1}/${Chirp.BANDS.size})")
-                val result = calibrateBand(index, band)
-                when (result) {
-                    is LatencyCalibrator.Result.Success ->
-                        Log.d(TAG, "Band $band -> ${result.trimMs}ms")
-                    is LatencyCalibrator.Result.Failure ->
-                        Log.d(TAG, "Band $band -> failed: ${result.reason}")
-                }
-                result
-            }
-            val trims = results.filterIsInstance<LatencyCalibrator.Result.Success>().map { it.trimMs }
-            if (trims.isEmpty()) {
-                val reason = results.filterIsInstance<LatencyCalibrator.Result.Failure>()
-                    .lastOrNull()?.reason ?: "Calibration failed — try again"
-                Log.d(TAG, "Calibration: 0/${results.size} bands succeeded")
-                LatencyCalibrator.Result.Failure(reason)
-            } else {
-                val median = median(trims)
-                Log.d(TAG, "Calibration: $trims -> median ${median}ms (${trims.size}/${results.size} bands succeeded)")
-                LatencyCalibrator.Result.Success(median)
-            }
-        }
-
-    /**
-     * One request/chirp/measure round for a single frequency band.
-     *
-     * Called from [calibrate], which already runs on this engine's IO scope,
-     * unlike everything else here which is dispatched onto it explicitly —
-     * so this can touch the socket directly. Blocking socket I/O on Main
-     * throws NetworkOnMainThreadException, which was getting silently
-     * swallowed by the runCatching around send(), meaning the request never
-     * actually left the device.
-     */
-    private suspend fun calibrateBand(bandIndex: Int, band: Chirp.Band): LatencyCalibrator.Result {
-        val deferred = CompletableDeferred<PartyMessage?>()
-        pendingCalibration = deferred
-        runCatching { send(PartyMessage.CalibrateRequest(bandIndex)) }
-            .onFailure { Log.w(TAG, "Calibrate request failed to send: ${it.message}") }
-        val reply = withTimeoutOrNull(CALIBRATE_REPLY_TIMEOUT_MS) { deferred.await() }
-        pendingCalibration = null
-        return when (reply) {
-            is PartyMessage.CalibrateChirp -> {
-                val offset = clockSync.clockOffsetMs ?: 0L
-                val hostChirpLocal = reply.atHostElapsedMs - offset
-                val result = LatencyCalibrator(context).measure(
-                    hostChirpAtLocalMs = hostChirpLocal,
-                    ownChirpAtLocalMs = hostChirpLocal + Chirp.OWN_CHIRP_DELAY_MS,
-                    band = band,
-                )
-                // Tell the host this round is actually done — it's waiting on
-                // this instead of guessing our timing, so the next band's
-                // request doesn't get denied as "still busy".
-                runCatching { send(PartyMessage.CalibrateComplete(bandIndex)) }
-                result
-            }
-            is PartyMessage.CalibrateDenied -> LatencyCalibrator.Result.Failure(reply.reason)
-            else -> LatencyCalibrator.Result.Failure("The host didn't respond — try again")
-        }
-    }
-
-    private fun median(values: List<Long>): Long {
-        val sorted = values.sorted()
-        val mid = sorted.size / 2
-        return if (sorted.size % 2 == 1) sorted[mid] else (sorted[mid - 1] + sorted[mid]) / 2
-    }
+        calibration.calibrate(onProgress)
 
     /** The host's live position, relayed every drift tick; the drift loop chases this directly. */
     private fun onHostSync(sync: PartyMessage.HostSync) {
@@ -843,7 +771,6 @@ class PartyGuestEngine(
         /** Reconnect every few seconds for ~2 minutes before giving up. */
         const val RECONNECT_DELAY_MS = 3_000L
         const val MAX_RECONNECT_ATTEMPTS = 40
-        const val CALIBRATE_REPLY_TIMEOUT_MS = 5_000L
 
         /** Player-error recovery: retries within this window count toward the cap below. */
         const val ERROR_WINDOW_MS = 10_000L
