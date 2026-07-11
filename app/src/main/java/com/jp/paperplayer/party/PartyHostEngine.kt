@@ -16,11 +16,9 @@ import com.jp.paperplayer.model.data.PartyEqRole
 import com.jp.paperplayer.model.data.PartyMember
 import com.jp.paperplayer.model.data.PartyMemberStatus
 import com.jp.paperplayer.model.data.PartyMemberSyncStats
-import com.jp.paperplayer.model.data.Song
 import com.jp.paperplayer.model.data.SyncHealth
 import com.jp.paperplayer.model.ui.PartyRole
 import com.jp.paperplayer.model.ui.PartyUiState
-import com.jp.paperplayer.scanner.MusicScanner
 import com.jp.paperplayer.service.PlaybackService
 import java.io.BufferedReader
 import java.io.BufferedWriter
@@ -29,7 +27,6 @@ import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.security.MessageDigest
 import java.util.UUID
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CancellationException
@@ -67,8 +64,9 @@ class PartyHostEngine(
     @Suppress("DEPRECATION")
     private val wifiLock = (context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
         .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PaperPlayer:partyHost")
+    private val songCatalog = PartyHostSongCatalog(context)
     private val fileServer = PartyFileServer(context) { songId ->
-        runBlocking { resolveSong(songId) }
+        runBlocking { songCatalog.resolve(songId) }
     }
 
     private var serverSocket: ServerSocket? = null
@@ -132,8 +130,6 @@ class PartyHostEngine(
     @Volatile
     private var currentSongId: Long? = null
     private var awaitingReady = mutableSetOf<String>()
-    private var songCache: Map<Long, Song>? = null
-    private val hashCache = mutableMapOf<Long, String>()
     private var calibrating = false
     private var calibratingMemberId: String? = null
     private var calibratingBandIndex = -1
@@ -402,9 +398,9 @@ class PartyHostEngine(
     private fun sendCurrentSongTo(client: ClientConnection) {
         val songId = currentSongId ?: return
         scope.launch {
-            val song = resolveSong(songId) ?: return@launch
+            val song = songCatalog.resolve(songId) ?: return@launch
             setStatus(client.memberId, PartyMemberStatus.DOWNLOADING)
-            runCatching { client.send(prepareMessage(song, sha256Of(song))) }
+            runCatching { client.send(songCatalog.prepareMessage(song, songCatalog.sha256(song))) }
         }
     }
 
@@ -589,7 +585,7 @@ class PartyHostEngine(
             Log.w(TAG, "${client.deviceName}: resync aborted — host isn't playing")
             return
         }
-        val sha256 = resolveSong(songId)?.let { sha256Of(it) } ?: ""
+        val sha256 = songCatalog.resolve(songId)?.let { songCatalog.sha256(it) } ?: ""
         setStatus(client.memberId, PartyMemberStatus.SYNCING)
         val ack = CompletableDeferred<Boolean>()
         synchronized(clients) { singleClientSyncAcks[client.memberId] = ack }
@@ -644,8 +640,8 @@ class PartyHostEngine(
     private fun resendFile(client: ClientConnection, songId: Long) {
         setStatus(client.memberId, PartyMemberStatus.DOWNLOADING)
         scope.launch {
-            val song = resolveSong(songId) ?: return@launch
-            runCatching { client.send(prepareMessage(song, sha256Of(song))) }
+            val song = songCatalog.resolve(songId) ?: return@launch
+            runCatching { client.send(songCatalog.prepareMessage(song, songCatalog.sha256(song))) }
         }
     }
 
@@ -759,7 +755,7 @@ class PartyHostEngine(
         controller?.seekTo(0L)
         startCycle?.cancel()
         startCycle = scope.launch {
-            val song = resolveSong(songId)
+            val song = songCatalog.resolve(songId)
             if (song == null) {
                 Log.w(TAG, "Song $songId not found; releasing playback")
                 withContext(Dispatchers.Main) {
@@ -768,10 +764,10 @@ class PartyHostEngine(
                 }
                 return@launch
             }
-            val sha256 = sha256Of(song)
+            val sha256 = songCatalog.sha256(song)
             synchronized(clients) { awaitingReady = clients.keys.toMutableSet() }
             setAllStatuses(PartyMemberStatus.DOWNLOADING)
-            broadcast(prepareMessage(song, sha256))
+            broadcast(songCatalog.prepareMessage(song, sha256))
             awaitReadySet(READY_TIMEOUT_MS)
             runStartChecklist(songId, sha256, positionMs = 0L, leadMs = TRACK_START_LEAD_MS)
         }
@@ -790,7 +786,7 @@ class PartyHostEngine(
         controller?.seekTo(positionMs.coerceAtLeast(0L))
         startCycle?.cancel()
         startCycle = scope.launch {
-            val sha256 = resolveSong(songId)?.let { sha256Of(it) } ?: ""
+            val sha256 = songCatalog.resolve(songId)?.let { songCatalog.sha256(it) } ?: ""
             runStartChecklist(songId, sha256, positionMs, leadMs = TRACK_START_LEAD_MS)
         }
     }
@@ -986,40 +982,6 @@ class PartyHostEngine(
         }
     }
 
-    private fun prepareMessage(song: Song, sha256: String): PartyMessage.Prepare {
-        val sizeBytes = runCatching {
-            context.contentResolver.openAssetFileDescriptor(song.uri, "r")?.use { it.length } ?: -1L
-        }.getOrDefault(-1L)
-        return PartyMessage.Prepare(
-            songId = song.id,
-            title = song.title,
-            artist = song.artist,
-            album = song.album,
-            durationMs = song.duration,
-            ext = song.filePath.substringAfterLast('.', "mp3"),
-            sizeBytes = sizeBytes,
-            sha256 = sha256,
-        )
-    }
-
-    /** Cached per song; an unreadable file yields "" which disables hash checks. */
-    private suspend fun sha256Of(song: Song): String = withContext(Dispatchers.IO) {
-        synchronized(hashCache) { hashCache[song.id] }?.let { return@withContext it }
-        val digest = MessageDigest.getInstance("SHA-256")
-        val stream = context.contentResolver.openInputStream(song.uri) ?: return@withContext ""
-        stream.use { input ->
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-                val read = input.read(buffer)
-                if (read < 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        val hex = digest.digest().joinToString("") { "%02x".format(it) }
-        synchronized(hashCache) { hashCache[song.id] = hex }
-        hex
-    }
-
     /** Main thread only; counts a listener event only when state actually flips. */
     private fun enginePause() {
         val c = controller ?: return
@@ -1036,13 +998,6 @@ class PartyHostEngine(
             pendingEngineEvents++
             c.play()
         }
-    }
-
-    private suspend fun resolveSong(songId: Long): Song? {
-        songCache?.get(songId)?.let { return it }
-        val scanned = MusicScanner(context).scan().associateBy { it.id }
-        songCache = scanned
-        return scanned[songId]
     }
 
     // ── Roster & broadcast helpers ──────────────────────────────────────────
