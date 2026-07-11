@@ -26,6 +26,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.jp.paperplayer.data.PartyFileTransferMode
 import com.jp.paperplayer.data.ShuffleStrategy
 import com.jp.paperplayer.model.data.MusicFolder
 import com.jp.paperplayer.ui.player.PlayerViewModel
@@ -41,12 +42,15 @@ fun SettingsScreen(
     onNavigateBack: () -> Unit,
 ) {
     val strategy by playerViewModel.shuffleStrategy.collectAsStateWithLifecycle()
+    val fileTransferMode by playerViewModel.partyFileTransferMode.collectAsStateWithLifecycle()
     val musicFolders by songListViewModel.musicFolders.collectAsStateWithLifecycle()
     SettingsContent(
         shuffleStrategy = strategy,
+        partyFileTransferMode = fileTransferMode,
         musicFolders = musicFolders,
         onNavigateBack = onNavigateBack,
         onShuffleStrategyChange = playerViewModel::setShuffleStrategy,
+        onPartyFileTransferModeChange = playerViewModel::setPartyFileTransferMode,
         onFolderExcludedChange = songListViewModel::setFolderExcluded,
     )
 }
@@ -55,9 +59,11 @@ fun SettingsScreen(
 @Composable
 private fun SettingsContent(
     shuffleStrategy: ShuffleStrategy,
+    partyFileTransferMode: PartyFileTransferMode,
     musicFolders: List<MusicFolder>,
     onNavigateBack: () -> Unit,
     onShuffleStrategyChange: (ShuffleStrategy) -> Unit,
+    onPartyFileTransferModeChange: (PartyFileTransferMode) -> Unit,
     onFolderExcludedChange: (path: String, excluded: Boolean) -> Unit,
 ) {
     Scaffold(
@@ -83,17 +89,42 @@ private fun SettingsContent(
                 color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
             )
-            ShuffleStrategyRow(
+            RadioSettingRow(
                 title = "Smart shuffle",
                 description = "Favors songs you haven't played as much",
                 selected = shuffleStrategy == ShuffleStrategy.SMART,
                 onClick = { onShuffleStrategyChange(ShuffleStrategy.SMART) },
             )
-            ShuffleStrategyRow(
+            RadioSettingRow(
                 title = "Random shuffle",
                 description = "Plain random order, no weighting",
                 selected = shuffleStrategy == ShuffleStrategy.RANDOM,
                 onClick = { onShuffleStrategyChange(ShuffleStrategy.RANDOM) },
+            )
+
+            Text(
+                text = "Party mode",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+            )
+            Text(
+                text = "How to get a song's audio from the host when you join as a guest",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 20.dp),
+            )
+            RadioSettingRow(
+                title = "Download before playing",
+                description = "More reliable, uses local storage",
+                selected = partyFileTransferMode == PartyFileTransferMode.DOWNLOAD,
+                onClick = { onPartyFileTransferModeChange(PartyFileTransferMode.DOWNLOAD) },
+            )
+            RadioSettingRow(
+                title = "Stream while playing",
+                description = "No local storage used, needs a steady WiFi connection",
+                selected = partyFileTransferMode == PartyFileTransferMode.STREAM,
+                onClick = { onPartyFileTransferModeChange(PartyFileTransferMode.STREAM) },
             )
 
             Text(
@@ -161,7 +192,7 @@ private fun MusicFolderRow(
 }
 
 @Composable
-private fun ShuffleStrategyRow(
+private fun RadioSettingRow(
     title: String,
     description: String,
     selected: Boolean,
@@ -196,9 +227,11 @@ internal fun SettingsContentPreview() {
     PaperPlayerTheme {
         SettingsContent(
             shuffleStrategy = ShuffleStrategy.SMART,
+            partyFileTransferMode = PartyFileTransferMode.DOWNLOAD,
             musicFolders = PreviewFixtures.musicFolders,
             onNavigateBack = {},
             onShuffleStrategyChange = {},
+            onPartyFileTransferModeChange = {},
             onFolderExcludedChange = { _, _ -> },
         )
     }
