@@ -25,8 +25,6 @@ import com.jp.paperplayer.model.ui.SyncQuality
 import com.jp.paperplayer.service.PlaybackService
 import java.io.BufferedWriter
 import java.io.File
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -73,8 +71,8 @@ class PartyGuestEngine(
     // control socket — see PartyProtocol's doc comment. Persists across a
     // reconnect (same bound local port); re-learned from each WELCOME since
     // the host's UDP port could differ across host sessions.
-    private var udpSocket: DatagramSocket? = null
-    private var hostUdpAddress: InetSocketAddress? = null
+    private val udpChannel = PartyGuestUdpChannel(onHostSync = ::onHostSync)
+    private var udpLocalPort = 0
 
     // Auto-reconnect after a dropped connection (WiFi power-save, AP roaming).
     @Volatile
@@ -196,9 +194,7 @@ class PartyGuestEngine(
         downloader.cleanup() // purge stale files from a previous crash
         if (!wifiLock.isHeld) wifiLock.acquire()
         connectController()
-        val udp = DatagramSocket(0)
-        udpSocket = udp
-        scope.launch { udpReceiveLoop(udp) }
+        udpLocalPort = udpChannel.start(scope)
         scope.launch {
             try {
                 val s = Socket()
@@ -206,7 +202,7 @@ class PartyGuestEngine(
                 socket = s
                 hostAddress = party.hostAddress
                 writer = s.getOutputStream().bufferedWriter()
-                send(PartyMessage.Hello(PartyProtocol.VERSION, deviceName, udp.localPort))
+                send(PartyMessage.Hello(PartyProtocol.VERSION, deviceName, udpLocalPort))
                 readLoop(s)
             } catch (e: Exception) {
                 Log.d(TAG, "Join failed: ${e.message}")
@@ -236,8 +232,7 @@ class PartyGuestEngine(
             }
             runCatching { s?.close() }
         }
-        runCatching { udpSocket?.close() }
-        hostUdpAddress = null
+        udpChannel.stop()
         nsd.stopDiscovery()
         releasePlayback()
         downloader.cleanup()
@@ -278,30 +273,10 @@ class PartyGuestEngine(
         onDisconnected()
     }
 
-    /**
-     * Receives HOST_SYNC datagrams. Runs for the life of the party session,
-     * independent of TCP reconnects — a stray datagram from before a
-     * reconnect (or after leave() has already closed the socket) is just a
-     * no-op parse/dispatch once the socket is actually closed.
-     */
-    private fun udpReceiveLoop(socket: DatagramSocket) {
-        val buffer = ByteArray(UDP_BUFFER_SIZE)
-        while (!socket.isClosed) {
-            val packet = DatagramPacket(buffer, buffer.size)
-            try {
-                socket.receive(packet)
-            } catch (e: Exception) {
-                break
-            }
-            val message = PartyMessage.parse(String(packet.data, packet.offset, packet.length, Charsets.UTF_8))
-            if (message is PartyMessage.HostSync) onHostSync(message)
-        }
-    }
-
     private fun onWelcome(welcome: PartyMessage.Welcome) {
         httpPort = welcome.httpPort
         reconnectAttempts = 0
-        hostAddress?.let { hostUdpAddress = InetSocketAddress(InetAddress.getByName(it), welcome.udpPort) }
+        hostAddress?.let { udpChannel.setHostEndpoint(InetSocketAddress(InetAddress.getByName(it), welcome.udpPort)) }
         stopDiscovery()
         update {
             it.copy(
@@ -580,7 +555,7 @@ class PartyGuestEngine(
                         nudgeCorrections = nudgeCount,
                         latencyTrimMs = latencyTrimMs,
                     )
-                    scope.launch { sendUdp(stats) }
+                    udpChannel.sendAsync(stats, scope)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -821,7 +796,7 @@ class PartyGuestEngine(
                 socket = s
                 hostAddress = party.hostAddress
                 writer = s.getOutputStream().bufferedWriter()
-                send(PartyMessage.Hello(PartyProtocol.VERSION, lastDeviceName, udpSocket?.localPort ?: 0))
+                send(PartyMessage.Hello(PartyProtocol.VERSION, lastDeviceName, udpLocalPort))
                 readLoop(s)
             } catch (e: Exception) {
                 Log.d(TAG, "Reconnect failed: ${e.message}")
@@ -839,29 +814,9 @@ class PartyGuestEngine(
         }
     }
 
-    /**
-     * Fire-and-forget, sent [UDP_SEND_REDUNDANCY] times: UDP has no
-     * retransmission, so a lost SYNC_STATS is just gone. A cheap duplicate
-     * send roughly squares the effective loss probability for the tick.
-     */
-    private fun sendUdp(message: PartyMessage) {
-        val socket = udpSocket ?: return
-        val endpoint = hostUdpAddress ?: return
-        val bytes = message.encode().toByteArray(Charsets.UTF_8)
-        repeat(UDP_SEND_REDUNDANCY) {
-            runCatching { socket.send(DatagramPacket(bytes, bytes.size, endpoint)) }
-        }
-    }
-
     private companion object {
         const val TAG = "PartyGuestEngine"
         const val CONNECT_TIMEOUT_MS = 5_000
-
-        /** Generous for a small JSON payload (HOST_SYNC/SYNC_STATS are well under 300 bytes). */
-        const val UDP_BUFFER_SIZE = 2048
-
-        /** Duplicate sends per SYNC_STATS tick — UDP has no retransmission, so this is the cheap substitute. */
-        const val UDP_SEND_REDUNDANCY = 2
 
         /** Small lead added to corrective seeks to cover the seek latency itself. */
         const val SEEK_LEAD_MS = 60L
