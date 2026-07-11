@@ -42,8 +42,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -131,13 +129,7 @@ class PartyGuestEngine(
 
     private val settings = SettingsStore(context)
 
-    /** hostClock - guestClock; null until the first ping round completes. */
-    @Volatile
-    var clockOffsetMs: Long? = null
-        private set
-
-    @Volatile
-    private var lastMedianRttMs = 0L
+    private val clockSync = PartyGuestClockSync(send = ::send, update = update)
 
     /**
      * Manual audio-latency compensation set by the user: positive means this
@@ -163,11 +155,6 @@ class PartyGuestEngine(
         }
     }
 
-    private var pingSeq = 0
-    // Serializes ping rounds: the periodic refresh and a pre-start sync check
-    // must not interleave their samples.
-    private val pingMutex = Mutex()
-    private val pendingSamples = mutableListOf<PingSample>()
     // Written on the caller's thread (calibrate() hops onto its own IO
     // context, but the readLoop that delivers the reply is a separate IO
     // thread) so this needs @Volatile for cross-thread visibility.
@@ -272,7 +259,7 @@ class PartyGuestEngine(
                         update { it.copy(isJoining = false, error = message.reason) }
                         return
                     }
-                    is PartyMessage.Pong -> onPong(message)
+                    is PartyMessage.Pong -> clockSync.onPong(message)
                     is PartyMessage.Prepare -> onPrepare(message)
                     is PartyMessage.SyncCheck -> onSyncCheck(message)
                     is PartyMessage.Start -> onStart(message)
@@ -326,7 +313,7 @@ class PartyGuestEngine(
                 error = null,
             )
         }
-        scope.launch { pingRounds() }
+        clockSync.start(scope)
     }
 
     // ── Playback ────────────────────────────────────────────────────────────
@@ -384,7 +371,7 @@ class PartyGuestEngine(
                 runCatching { send(PartyMessage.SyncReady(check.songId, false, "file missing or stale")) }
                 return@launch
             }
-            runPingRound(ClockSync.REFRESH_PING_COUNT)
+            clockSync.runPingRound(ClockSync.REFRESH_PING_COUNT)
             withContext(Dispatchers.Main) {
                 controller?.let { c ->
                     c.setPlaybackParameters(PlaybackParameters.DEFAULT)
@@ -419,26 +406,6 @@ class PartyGuestEngine(
     }
 
     /**
-     * A brand-new join (or a reconnect after a fresh process start) can have
-     * its cached file pass the download/hash check almost instantly, so the
-     * host's late-join START can arrive before the very first ping round
-     * (JOIN_PING_COUNT samples, ~1.7s) has produced a clock offset. Falling
-     * back to an offset of 0 would treat the host's elapsedRealtime as if it
-     * were this device's own — elapsedRealtime is boot-relative, so the two
-     * can differ by any amount, and the guest ends up targeting a garbage
-     * instant (never starts, or seeks somewhere nonsensical). Wait briefly
-     * for the in-flight ping round instead.
-     */
-    private suspend fun awaitClockOffset(): Long {
-        clockOffsetMs?.let { return it }
-        val deadline = SystemClock.elapsedRealtime() + CLOCK_OFFSET_WAIT_TIMEOUT_MS
-        while (clockOffsetMs == null && SystemClock.elapsedRealtime() < deadline) {
-            delay(50L)
-        }
-        return clockOffsetMs ?: 0L
-    }
-
-    /**
      * Starts playback of [positionMs] exactly when this device's clock reaches
      * the host instant [atHostElapsedMs] (converted via the measured offset).
      * If the moment already passed — slow download, late join — starts
@@ -454,7 +421,7 @@ class PartyGuestEngine(
         lastHostSyncAtLocalMs = null
         lastHostSyncHostElapsedMs = Long.MIN_VALUE
         pendingStartJob = scope.launch {
-            val offset = awaitClockOffset()
+            val offset = clockSync.awaitOffset()
             val localTarget = atHostElapsedMs - offset
             // Tick the countdown down to the last ~150ms, then hand over to the
             // precise start below.
@@ -604,10 +571,10 @@ class PartyGuestEngine(
                     // sign of exactly that, distinct from genuine audio drift.
                     val stats = PartyMessage.SyncStats(
                         deviceAtMs = nowLocal,
-                        hostAtMs = nowLocal + (clockOffsetMs ?: 0L),
+                        hostAtMs = nowLocal + (clockSync.clockOffsetMs ?: 0L),
                         expectedPositionMs = expected,
                         actualPositionMs = actual,
-                        rttMs = lastMedianRttMs,
+                        rttMs = clockSync.lastMedianRttMs,
                         playbackSpeed = currentSpeed,
                         seekCorrections = seekCount,
                         nudgeCorrections = nudgeCount,
@@ -777,7 +744,7 @@ class PartyGuestEngine(
         pendingCalibration = null
         return when (reply) {
             is PartyMessage.CalibrateChirp -> {
-                val offset = clockOffsetMs ?: 0L
+                val offset = clockSync.clockOffsetMs ?: 0L
                 val hostChirpLocal = reply.atHostElapsedMs - offset
                 val result = LatencyCalibrator(context).measure(
                     hostChirpAtLocalMs = hostChirpLocal,
@@ -801,48 +768,10 @@ class PartyGuestEngine(
         return if (sorted.size % 2 == 1) sorted[mid] else (sorted[mid - 1] + sorted[mid]) / 2
     }
 
-    // ── Clock sync ──────────────────────────────────────────────────────────
-
-    private suspend fun pingRounds() {
-        runPingRound(ClockSync.JOIN_PING_COUNT)
-        while (true) {
-            delay(OFFSET_REFRESH_INTERVAL_MS)
-            runPingRound(ClockSync.REFRESH_PING_COUNT)
-        }
-    }
-
-    private suspend fun runPingRound(count: Int) = pingMutex.withLock {
-        synchronized(pendingSamples) { pendingSamples.clear() }
-        repeat(count) {
-            runCatching { send(PartyMessage.Ping(++pingSeq, SystemClock.elapsedRealtime())) }
-            delay(ClockSync.PING_INTERVAL_MS)
-        }
-        // Grace period for the last replies to arrive.
-        delay(500L)
-        val samples = synchronized(pendingSamples) { pendingSamples.toList() }
-        if (samples.isEmpty()) return
-        clockOffsetMs = ClockSync.estimateOffsetMs(samples)
-        val quality = if (ClockSync.isQualityPoor(samples)) SyncQuality.POOR else SyncQuality.GOOD
-        val medianRtt = ClockSync.medianRttMs(samples)
-        lastMedianRttMs = medianRtt ?: 0L
-        update {
-            it.copy(
-                syncQuality = quality,
-                rttMs = medianRtt,
-                syncDebug = it.syncDebug.copy(clockOffsetMs = clockOffsetMs, medianRttMs = medianRtt),
-            )
-        }
-    }
-
-    private fun onPong(pong: PartyMessage.Pong) {
-        val sample = PingSample(t0 = pong.t0, t1 = pong.t1, t2 = SystemClock.elapsedRealtime())
-        synchronized(pendingSamples) { pendingSamples.add(sample) }
-    }
-
     /** The host's live position, relayed every drift tick; the drift loop chases this directly. */
     private fun onHostSync(sync: PartyMessage.HostSync) {
         if (sync.atHostElapsedMs <= lastHostSyncHostElapsedMs) return
-        val offset = clockOffsetMs ?: return
+        val offset = clockSync.clockOffsetMs ?: return
         lastHostSyncHostElapsedMs = sync.atHostElapsedMs
         lastHostSyncAtLocalMs = sync.atHostElapsedMs - offset
         lastHostSyncPositionMs = sync.positionMs
@@ -927,16 +856,12 @@ class PartyGuestEngine(
     private companion object {
         const val TAG = "PartyGuestEngine"
         const val CONNECT_TIMEOUT_MS = 5_000
-        const val OFFSET_REFRESH_INTERVAL_MS = 30_000L
 
         /** Generous for a small JSON payload (HOST_SYNC/SYNC_STATS are well under 300 bytes). */
         const val UDP_BUFFER_SIZE = 2048
 
         /** Duplicate sends per SYNC_STATS tick — UDP has no retransmission, so this is the cheap substitute. */
         const val UDP_SEND_REDUNDANCY = 2
-
-        /** Ceiling for schedulePlay to wait for the in-flight join ping round (~1.7s worst case). */
-        const val CLOCK_OFFSET_WAIT_TIMEOUT_MS = 3_000L
 
         /** Small lead added to corrective seeks to cover the seek latency itself. */
         const val SEEK_LEAD_MS = 60L
