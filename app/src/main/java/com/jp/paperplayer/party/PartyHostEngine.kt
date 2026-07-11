@@ -126,11 +126,15 @@ class PartyHostEngine(
     @Volatile
     private var currentSongId: Long? = null
     private var awaitingReady = mutableSetOf<String>()
-    private var calibrating = false
-    private var calibratingMemberId: String? = null
-    private var calibratingBandIndex = -1
-    private var calibrateCompleteAck: CompletableDeferred<Unit>? = null
-
+    private val calibrationCoordinator = PartyHostCalibrationCoordinator(
+        context = context,
+        scope = scope,
+        pauseHostPlayback = { if (controller?.playWhenReady == true) controller?.pause() },
+        sendToClient = { memberId, message ->
+            val client = synchronized(clients) { clients[memberId] }
+            if (client != null) runCatching { client.send(message) }
+        },
+    )
 
     // Out-of-band per-client SYNC_CHECK rounds (auto-resync watchdog), keyed
     // by memberId — distinct from the party-wide awaitingReady/checklist
@@ -331,8 +335,8 @@ class PartyHostEngine(
                     )
                     is PartyMessage.Ready -> onGuestReady(client, message.songId)
                     is PartyMessage.SyncReady -> onSyncReady(client, message)
-                    is PartyMessage.CalibrateRequest -> onCalibrateRequest(client, message.bandIndex)
-                    is PartyMessage.CalibrateComplete -> onCalibrateComplete(client, message.bandIndex)
+                    is PartyMessage.CalibrateRequest -> calibrationCoordinator.onCalibrateRequest(client.memberId, message.bandIndex)
+                    is PartyMessage.CalibrateComplete -> calibrationCoordinator.onCalibrateComplete(client.memberId, message.bandIndex)
                     is PartyMessage.Bye -> break
                     else -> {}
                 }
@@ -623,65 +627,6 @@ class PartyHostEngine(
                 }
                 markStarted(client.memberId)
                 setStatus(client.memberId, PartyMemberStatus.PLAYING)
-            }
-        }
-    }
-
-    /**
-     * Emits the host calibration chirp at an announced instant so the guest can
-     * measure the relative output latency. Music is paused (which propagates to
-     * all guests) so the room is quiet during the chirps.
-     */
-    private fun onCalibrateRequest(client: ClientConnection, bandIndex: Int) {
-        val ack = CompletableDeferred<Unit>()
-        synchronized(this) {
-            if (calibrating) {
-                runCatching { client.send(PartyMessage.CalibrateDenied("Another device is calibrating — try again in a moment")) }
-                return
-            }
-            calibrating = true
-            calibratingMemberId = client.memberId
-            calibratingBandIndex = bandIndex
-            calibrateCompleteAck = ack
-        }
-        scope.launch {
-            try {
-                val band = Chirp.BANDS.getOrElse(bandIndex) { Chirp.BANDS[0] }
-                withContext(Dispatchers.Main) {
-                    // A plain pause (not enginePause) so the pause propagates to guests.
-                    if (controller?.playWhenReady == true) controller?.pause()
-                }
-                val at = SystemClock.elapsedRealtime() + CALIBRATE_LEAD_MS
-                runCatching { client.send(PartyMessage.CalibrateChirp(at, bandIndex)) }
-                ExoChirpPlayer.playAt(context, Chirp.hostChirpPcm(band), Chirp.SAMPLE_RATE, at)
-                // Wait for the guest's own CALIBRATE_COMPLETE instead of
-                // guessing how long its chirp-and-record round takes — a
-                // fixed estimate here previously raced the guest's actual
-                // timing under real-world jitter (GC pauses, AudioRecord
-                // setup variance, WiFi retransmits). The timeout is a safety
-                // net only, for a guest that disconnects mid-round.
-                withTimeoutOrNull(CALIBRATE_COMPLETE_TIMEOUT_MS) { ack.await() }
-            } finally {
-                synchronized(this@PartyHostEngine) {
-                    calibrating = false
-                    calibratingMemberId = null
-                    calibratingBandIndex = -1
-                    calibrateCompleteAck = null
-                }
-            }
-        }
-    }
-
-    /**
-     * Guest -> host: its calibration round is done. Matched on both member
-     * and band so a late/stray ack from a different guest's earlier round
-     * can't complete an unrelated in-flight one that happens to reuse the
-     * same band index.
-     */
-    private fun onCalibrateComplete(client: ClientConnection, bandIndex: Int) {
-        synchronized(this) {
-            if (client.memberId == calibratingMemberId && bandIndex == calibratingBandIndex) {
-                calibrateCompleteAck?.complete(Unit)
             }
         }
     }
@@ -1014,11 +959,6 @@ class PartyHostEngine(
         /** Short lead for catching a late joiner up mid-song; the party keeps playing. */
         const val RESUME_LEAD_MS = 1_500L
 
-        /** Lead time announced before the host's calibration chirp. */
-        const val CALIBRATE_LEAD_MS = 1_500L
-
-        /** Safety net only: releases the busy lock even if a guest's CALIBRATE_COMPLETE never arrives. */
-        const val CALIBRATE_COMPLETE_TIMEOUT_MS = 5_000L
         const val SOCKET_READ_TIMEOUT_MS = 30_000
 
         // Host drift loop: measurement/reporting only (see startHostDriftLoop).
