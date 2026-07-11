@@ -1,6 +1,7 @@
 package com.jp.paperplayer.party
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -15,15 +16,19 @@ import kotlinx.coroutines.withContext
 /**
  * Measures the guest's audio output latency relative to the host, acoustically:
  * the host emits an up-sweep chirp at a known instant, this device emits a
- * down-sweep 800ms later, and one continuous mic recording captures both. The
- * interval between the two chirps in the recording, minus the scheduled 800ms,
- * is (guestOutputLatency - hostOutputLatency) — input latency cancels because
- * both chirps pass through the same mic chain, and acoustic travel is ~1ms/30cm
- * with the devices held together.
+ * down-sweep 800ms later, and one continuous mic recording captures both.
+ * Both chirps play through a real ExoPlayer ([ExoChirpPlayer]) rather than a
+ * bare AudioTrack, so the measured latency reflects the actual party-music
+ * pipeline (decode + streamed buffering) instead of a differently-configured
+ * proxy that doesn't transfer to real playback. Input latency cancels because
+ * both chirps pass through the same mic chain, and acoustic travel is
+ * ~1ms/30cm with the devices held together. See [detect] for the sign of the
+ * resulting trim, which is empirically inverted from the straightforward
+ * (interval - scheduledGap) derivation.
  *
  * Caller must hold the RECORD_AUDIO permission.
  */
-class LatencyCalibrator {
+class LatencyCalibrator(private val context: Context) {
 
     sealed class Result {
         data class Success(val trimMs: Long) : Result()
@@ -32,13 +37,17 @@ class LatencyCalibrator {
 
     /**
      * [hostChirpAtLocalMs] / [ownChirpAtLocalMs]: elapsedRealtime instants for
-     * the host's chirp (already clock-converted) and this device's own chirp.
+     * the host's chirp (already clock-converted) and this device's own chirp,
+     * both swept in [band].
      */
     @SuppressLint("MissingPermission")
-    suspend fun measure(hostChirpAtLocalMs: Long, ownChirpAtLocalMs: Long): Result = coroutineScope {
+    suspend fun measure(
+        hostChirpAtLocalMs: Long,
+        ownChirpAtLocalMs: Long,
+        band: Chirp.Band,
+    ): Result = coroutineScope {
         val recordAheadMs = 400L
-        val recordTailMs = 600L
-        val totalMs = (ownChirpAtLocalMs - hostChirpAtLocalMs) + recordAheadMs + recordTailMs
+        val totalMs = (ownChirpAtLocalMs - hostChirpAtLocalMs) + recordAheadMs + Chirp.RECORD_TAIL_MS
         val totalSamples = (Chirp.SAMPLE_RATE * totalMs / 1000L).toInt()
 
         val minBuffer = AudioRecord.getMinBufferSize(
@@ -66,8 +75,8 @@ class LatencyCalibrator {
             val recordingStartedAt = SystemClock.elapsedRealtime()
 
             // Own chirp plays in parallel while the read loop below fills the buffer.
-            launch(Dispatchers.IO) {
-                ChirpPlayer.playAt(Chirp.guestChirpPcm(), ownChirpAtLocalMs)
+            launch {
+                ExoChirpPlayer.playAt(context, Chirp.guestChirpPcm(band), Chirp.SAMPLE_RATE, ownChirpAtLocalMs)
             }
 
             withContext(Dispatchers.IO) {
@@ -80,7 +89,7 @@ class LatencyCalibrator {
             }
 
             withContext(Dispatchers.Default) {
-                detect(pcm, recordingStartedAt, hostChirpAtLocalMs, ownChirpAtLocalMs)
+                detect(pcm, recordingStartedAt, hostChirpAtLocalMs, ownChirpAtLocalMs, band)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Calibration failed: ${e.message}")
@@ -96,6 +105,7 @@ class LatencyCalibrator {
         recordingStartedAt: Long,
         hostChirpAtLocalMs: Long,
         ownChirpAtLocalMs: Long,
+        band: Chirp.Band,
     ): Result {
         val signal = Chirp.decimate(pcm)
         val rate = Chirp.DETECT_SAMPLE_RATE
@@ -105,19 +115,26 @@ class LatencyCalibrator {
 
         val hostExpected = expectedIndex(hostChirpAtLocalMs)
         val hostIndex = Chirp.findChirp(
-            signal, Chirp.hostTemplate(),
+            signal, Chirp.hostTemplate(band),
             hostExpected - windowSamples, hostExpected + windowSamples,
         ) ?: return Result.Failure("Couldn't hear the host — raise its media volume and hold the devices together")
 
         val ownExpected = expectedIndex(ownChirpAtLocalMs)
         val ownIndex = Chirp.findChirp(
-            signal, Chirp.guestTemplate(),
+            signal, Chirp.guestTemplate(band),
             ownExpected - windowSamples, ownExpected + windowSamples,
         ) ?: return Result.Failure("Couldn't hear this device — raise its media volume")
 
         val intervalMs = (ownIndex - hostIndex) * 1000L / rate
         val scheduledGapMs = ownChirpAtLocalMs - hostChirpAtLocalMs
-        val trimMs = intervalMs - scheduledGapMs
+        // The derivation says (interval - scheduledGap) = guestOutputLatency -
+        // hostOutputLatency, which is exactly the trim's sign convention — but
+        // that comes out inverted in practice (confirmed against a device's
+        // known-good ear-tuned trim), most likely because the up-sweep and
+        // down-sweep templates don't land symmetrically under the matched
+        // filter once the recording is decimated. Negate it to match reality
+        // until the asymmetry itself is tracked down.
+        val trimMs = -(intervalMs - scheduledGapMs)
         Log.d(TAG, "Chirps at $hostIndex/$ownIndex, interval ${intervalMs}ms, trim ${trimMs}ms")
 
         return if (trimMs in -MAX_TRIM_MS..MAX_TRIM_MS) {
@@ -129,7 +146,12 @@ class LatencyCalibrator {
 
     private companion object {
         const val TAG = "LatencyCalibrator"
-        const val SEARCH_WINDOW_MS = 350
+
+        // Widened from the bare-AudioTrack version's 350ms: ExoPlayer's
+        // decode + streamed-buffering pipeline has more (and less
+        // predictable) output latency than a MODE_STATIC AudioTrack, so the
+        // chirp can legitimately land further from its scheduled instant.
+        const val SEARCH_WINDOW_MS = 450
         const val MAX_TRIM_MS = 300L
     }
 }

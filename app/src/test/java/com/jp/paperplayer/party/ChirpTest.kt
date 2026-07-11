@@ -89,4 +89,26 @@ class ChirpTest {
         assertEquals(samples, Chirp.hostTemplate().size)
         assertEquals(samples, Chirp.guestTemplate().size)
     }
+
+    @Test
+    fun `finds a chirp at the planted position in every calibration band`() {
+        Chirp.BANDS.forEach { band ->
+            val template = Chirp.hostTemplate(band)
+            val signal = signalWith(template to 4_000, lengthSamples = 20_000)
+            val found = Chirp.findChirp(signal, template, 2_000, 8_000)
+            assertNotNull("band $band", found)
+            assertTrue("band $band expected ~4000, got $found", abs(found!! - 4_000) <= 2)
+        }
+    }
+
+    @Test
+    fun `a band's template does not falsely match another band's chirp`() {
+        val lowBand = Chirp.BANDS.first()
+        val highBand = Chirp.BANDS.last()
+        val chirpInLowBand = Chirp.hostTemplate(lowBand)
+        val signal = signalWith(chirpInLowBand to 4_000, lengthSamples = 20_000)
+
+        // Searching with the wrong band's template should not report a confident match.
+        assertNull(Chirp.findChirp(signal, Chirp.hostTemplate(highBand), 2_000, 8_000))
+    }
 }

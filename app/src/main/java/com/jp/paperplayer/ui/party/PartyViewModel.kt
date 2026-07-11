@@ -6,8 +6,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.jp.paperplayer.data.SettingsStore
 import com.jp.paperplayer.model.data.DiscoveredParty
+import com.jp.paperplayer.model.data.PartyEqRole
 import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.party.LatencyCalibrator
+import com.jp.paperplayer.party.PartyEqController
 import com.jp.paperplayer.party.PartyManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -45,16 +47,25 @@ class PartyViewModel(app: Application) : AndroidViewModel(app) {
     private val _calibrationMessage = MutableStateFlow<String?>(null)
     val calibrationMessage: StateFlow<String?> = _calibrationMessage
 
-    /** Caller must already hold the RECORD_AUDIO permission. */
+    /** Acoustically measured ideal trim awaiting the user's decision. */
+    private val _suggestedTrimMs = MutableStateFlow<Long?>(null)
+    val suggestedTrimMs: StateFlow<Long?> = _suggestedTrimMs
+
+    /**
+     * Measures the ideal trim acoustically and surfaces it as a suggestion —
+     * it never overwrites the current trim without the user accepting it.
+     * Caller must already hold the RECORD_AUDIO permission.
+     */
     fun calibrate() {
         if (_isCalibrating.value) return
         _isCalibrating.value = true
+        _suggestedTrimMs.value = null
         _calibrationMessage.value = "Listening… hold the devices together"
         viewModelScope.launch {
-            when (val result = PartyManager.calibrate()) {
+            when (val result = PartyManager.calibrate { message -> _calibrationMessage.value = message }) {
                 is LatencyCalibrator.Result.Success -> {
-                    setLatencyTrim(result.trimMs)
-                    _calibrationMessage.value = "Calibrated: ${if (result.trimMs > 0) "+" else ""}${result.trimMs} ms"
+                    _suggestedTrimMs.value = result.trimMs
+                    _calibrationMessage.value = null
                 }
                 is LatencyCalibrator.Result.Failure -> {
                     _calibrationMessage.value = result.reason
@@ -62,6 +73,15 @@ class PartyViewModel(app: Application) : AndroidViewModel(app) {
             }
             _isCalibrating.value = false
         }
+    }
+
+    fun applySuggestedTrim() {
+        _suggestedTrimMs.value?.let { setLatencyTrim(it) }
+        _suggestedTrimMs.value = null
+    }
+
+    fun dismissSuggestedTrim() {
+        _suggestedTrimMs.value = null
     }
 
     fun startHosting() {
@@ -78,4 +98,16 @@ class PartyViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun leaveParty() = PartyManager.stop()
+
+    /**
+     * This device's own currently active bass/mid/treble party role —
+     * whether it got there via the host's own local picker (self, if
+     * hosting) or a SET_EQ_ROLE message from the host (if a guest).
+     */
+    val myEqRole: StateFlow<PartyEqRole> = PartyEqController.role
+
+    /** Host only, and only for its own device: applies directly, no network round trip. */
+    fun setMyEqRole(role: PartyEqRole) = PartyEqController.setRole(role)
+
+    fun setGuestEqRole(memberId: String, role: PartyEqRole) = PartyManager.setGuestEqRole(memberId, role)
 }
