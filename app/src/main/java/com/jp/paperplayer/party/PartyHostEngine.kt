@@ -74,7 +74,7 @@ class PartyHostEngine(
         onSyncStats(client, stats, receivedAtHostMs)
     }
     private val clients = mutableMapOf<String, ClientConnection>()
-    private val statuses = mutableMapOf<String, PartyMemberStatus>()
+    private val rosterStatus = PartyHostRosterStatus()
     private val memberStats = mutableMapOf<String, PartyMemberSyncStats>()
     private var hostDeviceName: String = ""
     private var partyName: String = ""
@@ -131,12 +131,6 @@ class PartyHostEngine(
     private var calibratingBandIndex = -1
     private var calibrateCompleteAck: CompletableDeferred<Unit>? = null
 
-    // Bass/mid/treble "distributed speaker" role assigned to each guest —
-    // purely a fun/cosmetic layer, kept separate from the sync-critical
-    // maps above. Tracked host-side only so the dashboard can show what
-    // was last sent; the guest is the source of truth for whether it
-    // actually applied.
-    private val eqRoles = mutableMapOf<String, PartyEqRole>()
 
     // Out-of-band per-client SYNC_CHECK rounds (auto-resync watchdog), keyed
     // by memberId — distinct from the party-wide awaitingReady/checklist
@@ -246,7 +240,7 @@ class PartyHostEngine(
     /** Assigns [role] to one guest for the bass/mid/treble party trick; NONE turns it off. */
     fun setGuestEqRole(memberId: String, role: PartyEqRole) {
         val client = synchronized(clients) { clients[memberId] } ?: return
-        synchronized(eqRoles) { eqRoles[memberId] = role }
+        rosterStatus.setEqRole(memberId, role)
         runCatching { client.send(PartyMessage.SetEqRole(role)) }
         publishMembers()
     }
@@ -254,9 +248,8 @@ class PartyHostEngine(
     fun stop() {
         if (wifiLock.isHeld) wifiLock.release()
         val snapshot = synchronized(clients) { clients.values.toList().also { clients.clear() } }
-        synchronized(statuses) { statuses.clear() }
+        rosterStatus.clear()
         udpChannel.clearEndpoints()
-        synchronized(eqRoles) { eqRoles.clear() }
         PartyEqController.setRole(PartyEqRole.NONE)
         nsd.unregisterService()
         controller?.let { c ->
@@ -311,7 +304,7 @@ class PartyHostEngine(
             }
             client.deviceName = hello.deviceName
             synchronized(clients) { clients[memberId] = client }
-            synchronized(statuses) { statuses[memberId] = PartyMemberStatus.SYNCING }
+            rosterStatus.setStatus(memberId, PartyMemberStatus.SYNCING)
             // The guest's own outgoing UDP socket is bound to hello.udpPort,
             // so datagrams from it arrive from (its IP, that port) — the same
             // pair we can build right now from the already-connected TCP
@@ -348,13 +341,12 @@ class PartyHostEngine(
             Log.d(TAG, "Client $memberId dropped: ${e.message}")
         } finally {
             synchronized(clients) { clients.remove(memberId) }
-            synchronized(statuses) { statuses.remove(memberId) }
+            rosterStatus.remove(memberId)
             synchronized(memberStats) { memberStats.remove(memberId) }
             synchronized(clients) { awaitingReady.remove(memberId) }
             synchronized(clients) { singleClientSyncAcks.remove(memberId)?.complete(false) }
             synchronized(lastStartedAtMs) { lastStartedAtMs.remove(memberId) }
             udpChannel.removeEndpoint(memberId)
-            synchronized(eqRoles) { eqRoles.remove(memberId) }
             runCatching { socket.close() }
             publishMembers()
         }
@@ -981,12 +973,12 @@ class PartyHostEngine(
     }
 
     private fun setStatus(memberId: String, status: PartyMemberStatus) {
-        synchronized(statuses) { statuses[memberId] = status }
+        rosterStatus.setStatus(memberId, status)
         publishMembers()
     }
 
     private fun setAllStatuses(status: PartyMemberStatus) {
-        synchronized(statuses) { statuses.keys.forEach { statuses[it] = status } }
+        rosterStatus.setAllStatuses(status)
         publishMembers()
     }
 
@@ -996,11 +988,9 @@ class PartyHostEngine(
                 PartyMember(
                     id = client.memberId,
                     name = client.deviceName,
-                    status = synchronized(statuses) {
-                        statuses[client.memberId] ?: PartyMemberStatus.JOINING
-                    },
+                    status = rosterStatus.status(client.memberId),
                     stats = synchronized(memberStats) { memberStats[client.memberId] },
-                    eqRole = synchronized(eqRoles) { eqRoles[client.memberId] } ?: PartyEqRole.NONE,
+                    eqRole = rosterStatus.eqRole(client.memberId),
                 )
             }
         }
