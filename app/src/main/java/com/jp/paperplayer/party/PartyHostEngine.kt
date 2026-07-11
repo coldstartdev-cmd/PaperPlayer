@@ -65,7 +65,13 @@ class PartyHostEngine(
         val client = controlServer.get(memberId) ?: return@PartyHostUdpChannel
         onSyncStats(client, stats, receivedAtHostMs)
     }
-    private val controlServer = PartyHostControlServer(
+    // Explicit type: controlServer's own initializer references
+    // calibrationCoordinator (declared below) and calibrationCoordinator's
+    // initializer references controlServer::sendTo right back — a genuine
+    // mutual dependency between these two properties' inferred types that
+    // the compiler can't resolve without an explicit annotation on at least
+    // one side ("Type checking has run into a recursive problem").
+    private val controlServer: PartyHostControlServer = PartyHostControlServer(
         onHello = ::onHello,
         onReady = ::onGuestReady,
         onSyncReady = ::onSyncReady,
@@ -132,7 +138,7 @@ class PartyHostEngine(
 
     @Volatile
     private var currentSongId: Long? = null
-    private val calibrationCoordinator = PartyHostCalibrationCoordinator(
+    private val calibrationCoordinator: PartyHostCalibrationCoordinator = PartyHostCalibrationCoordinator(
         context = context,
         scope = scope,
         pauseHostPlayback = { if (controller?.playWhenReady == true) controller?.pause() },
