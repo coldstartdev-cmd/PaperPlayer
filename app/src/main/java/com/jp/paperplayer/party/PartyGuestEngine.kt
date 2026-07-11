@@ -20,11 +20,8 @@ import com.jp.paperplayer.model.ui.PartySyncDebug
 import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.model.ui.SyncQuality
 import com.jp.paperplayer.service.PlaybackService
-import java.io.BufferedWriter
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.Socket
-import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -56,10 +53,16 @@ class PartyGuestEngine(
     private val wifiLock = (context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
         .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PaperPlayer:partyGuest")
 
-    private var socket: Socket? = null
-    private var writer: BufferedWriter? = null
-    private var hostAddress: String? = null
     private var httpPort: Int = 0
+
+    private val controlChannel = PartyGuestControlChannel(
+        onMessage = ::dispatchMessage,
+        onRejected = { reason -> update { it.copy(isJoining = false, error = reason) } },
+        onJoinFailed = { partyServiceName ->
+            update { it.copy(isJoining = false, error = "Could not join $partyServiceName") }
+        },
+        onDisconnected = ::onDisconnected,
+    )
 
     // HOST_SYNC (in) and SYNC_STATS (out) travel over UDP, not the TCP
     // control socket — see PartyProtocol's doc comment. Persists across a
@@ -67,13 +70,6 @@ class PartyGuestEngine(
     // the host's UDP port could differ across host sessions.
     private val udpChannel = PartyGuestUdpChannel(onHostSync = ::onHostSync)
     private var udpLocalPort = 0
-
-    // Auto-reconnect after a dropped connection (WiFi power-save, AP roaming).
-    @Volatile
-    private var leaving = false
-    private var lastParty: DiscoveredParty? = null
-    private var lastDeviceName: String = ""
-    private var reconnectAttempts = 0
 
     private var controller: MediaController? = null
     private val downloadCoordinator = PartyGuestDownloadCoordinator(
@@ -83,7 +79,7 @@ class PartyGuestEngine(
         send = ::send,
         update = update,
         getController = { controller },
-        hostAddress = { hostAddress },
+        hostAddress = { controlChannel.hostAddress },
         httpPort = { httpPort },
         cancelActiveCycles = {
             pendingStartJob?.cancel()
@@ -192,53 +188,18 @@ class PartyGuestEngine(
     }
 
     fun join(party: DiscoveredParty, deviceName: String) {
-        leaving = false
-        reconnectAttempts = 0
-        lastParty = party
-        lastDeviceName = deviceName
         lastHostSyncAtLocalMs = null
         update { it.copy(isJoining = true, error = null) }
         downloader.cleanup() // purge stale files from a previous crash
         if (!wifiLock.isHeld) wifiLock.acquire()
         connectController()
         udpLocalPort = udpChannel.start(scope)
-        scope.launch {
-            try {
-                val s = Socket()
-                s.connect(InetSocketAddress(party.hostAddress, party.port), CONNECT_TIMEOUT_MS)
-                socket = s
-                hostAddress = party.hostAddress
-                writer = s.getOutputStream().bufferedWriter()
-                send(PartyMessage.Hello(PartyProtocol.VERSION, deviceName, udpLocalPort))
-                readLoop(s)
-            } catch (e: Exception) {
-                Log.d(TAG, "Join failed: ${e.message}")
-                update {
-                    it.copy(isJoining = false, error = "Could not join ${party.serviceName}")
-                }
-            }
-        }
+        controlChannel.connect(party, deviceName, udpLocalPort, scope)
     }
 
     fun leave() {
-        leaving = true
+        controlChannel.leave()
         if (wifiLock.isHeld) wifiLock.release()
-        val s = socket
-        val w = writer
-        socket = null
-        writer = null
-        thread(name = "party-guest-shutdown") {
-            runCatching {
-                if (w != null) {
-                    synchronized(w) {
-                        w.write(PartyMessage.Bye.encode())
-                        w.write("\n")
-                        w.flush()
-                    }
-                }
-            }
-            runCatching { s?.close() }
-        }
         udpChannel.stop()
         nsd.stopDiscovery()
         releasePlayback()
@@ -250,40 +211,27 @@ class PartyGuestEngine(
 
     // ── Control channel ─────────────────────────────────────────────────────
 
-    private fun readLoop(socket: Socket) {
-        val reader = socket.getInputStream().bufferedReader()
-        try {
-            while (true) {
-                val line = reader.readLine() ?: break
-                when (val message = PartyMessage.parse(line)) {
-                    is PartyMessage.Welcome -> onWelcome(message)
-                    is PartyMessage.Error -> {
-                        update { it.copy(isJoining = false, error = message.reason) }
-                        return
-                    }
-                    is PartyMessage.Pong -> clockSync.onPong(message)
-                    is PartyMessage.Prepare -> downloadCoordinator.onPrepare(message)
-                    is PartyMessage.SyncCheck -> downloadCoordinator.onSyncCheck(message)
-                    is PartyMessage.Start -> onStart(message)
-                    is PartyMessage.Pause -> onPause(message)
-                    is PartyMessage.Resume -> onResume(message)
-                    is PartyMessage.CalibrateChirp -> calibration.onReply(message)
-                    is PartyMessage.CalibrateDenied -> calibration.onReply(message)
-                    is PartyMessage.SetEqRole -> PartyEqController.setRole(message.role)
-                    is PartyMessage.Bye -> break
-                    else -> {}
-                }
-            }
-        } catch (e: Exception) {
-            Log.d(TAG, "Connection lost: ${e.message}")
+    /** Routes every message [PartyGuestControlChannel] doesn't special-case itself (BYE, ERROR — see its doc comment). */
+    private fun dispatchMessage(message: PartyMessage) {
+        when (message) {
+            is PartyMessage.Welcome -> onWelcome(message)
+            is PartyMessage.Pong -> clockSync.onPong(message)
+            is PartyMessage.Prepare -> downloadCoordinator.onPrepare(message)
+            is PartyMessage.SyncCheck -> downloadCoordinator.onSyncCheck(message)
+            is PartyMessage.Start -> onStart(message)
+            is PartyMessage.Pause -> onPause(message)
+            is PartyMessage.Resume -> onResume(message)
+            is PartyMessage.CalibrateChirp -> calibration.onReply(message)
+            is PartyMessage.CalibrateDenied -> calibration.onReply(message)
+            is PartyMessage.SetEqRole -> PartyEqController.setRole(message.role)
+            else -> {}
         }
-        onDisconnected()
     }
 
     private fun onWelcome(welcome: PartyMessage.Welcome) {
         httpPort = welcome.httpPort
-        reconnectAttempts = 0
-        hostAddress?.let { udpChannel.setHostEndpoint(InetSocketAddress(InetAddress.getByName(it), welcome.udpPort)) }
+        controlChannel.resetReconnectAttempts()
+        controlChannel.hostAddress?.let { udpChannel.setHostEndpoint(InetSocketAddress(InetAddress.getByName(it), welcome.udpPort)) }
         stopDiscovery()
         update {
             it.copy(
@@ -607,71 +555,35 @@ class PartyGuestEngine(
         lastHostSyncPositionMs = sync.positionMs
     }
 
-    private fun onDisconnected() {
-        runCatching { socket?.close() }
-        socket = null
-        writer = null
+    /**
+     * [willRetry] reflects whether [PartyGuestControlChannel] has already
+     * scheduled a reconnect attempt — this only handles the parts that
+     * aren't the channel's concern: playback-core job cancellation, pausing
+     * the player, and the UI-facing error text (worded differently for
+     * "still trying" vs "gave up").
+     */
+    private fun onDisconnected(willRetry: Boolean) {
         pendingStartJob?.cancel()
         driftJob?.cancel()
         scope.launch(Dispatchers.Main) { controller?.pause() }
-        val party = lastParty
-        if (!leaving && party != null && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-            reconnectAttempts++
-            update {
-                if (it.role == PartyRole.GUEST) {
-                    it.copy(error = "Connection lost — reconnecting…", isDownloading = false, startsInMs = null)
-                } else it
-            }
-            attemptReconnect(party)
-            return
-        }
         update {
-            if (it.role == PartyRole.GUEST) {
-                it.copy(error = "Lost connection to the party", isDownloading = false, startsInMs = null)
-            } else {
-                it.copy(isJoining = false)
-            }
-        }
-    }
-
-    /**
-     * Rejoins the last host after a dropped connection. The host treats us as
-     * a fresh late joiner: WELCOME, then the current song's PREPARE — the
-     * cached download passes the hash check, so READY is near-instant and the
-     * host's catch-up START drops us back into the running song in sync.
-     */
-    private fun attemptReconnect(party: DiscoveredParty) {
-        scope.launch {
-            delay(RECONNECT_DELAY_MS)
-            if (leaving) return@launch
-            Log.d(TAG, "Reconnect attempt $reconnectAttempts to ${party.hostAddress}")
-            try {
-                val s = Socket()
-                s.connect(InetSocketAddress(party.hostAddress, party.port), CONNECT_TIMEOUT_MS)
-                socket = s
-                hostAddress = party.hostAddress
-                writer = s.getOutputStream().bufferedWriter()
-                send(PartyMessage.Hello(PartyProtocol.VERSION, lastDeviceName, udpLocalPort))
-                readLoop(s)
-            } catch (e: Exception) {
-                Log.d(TAG, "Reconnect failed: ${e.message}")
-                onDisconnected() // schedules the next attempt or gives up
+            when {
+                it.role == PartyRole.GUEST && willRetry ->
+                    it.copy(error = "Connection lost — reconnecting…", isDownloading = false, startsInMs = null)
+                it.role == PartyRole.GUEST ->
+                    it.copy(error = "Lost connection to the party", isDownloading = false, startsInMs = null)
+                willRetry -> it
+                else -> it.copy(isJoining = false)
             }
         }
     }
 
     private fun send(message: PartyMessage) {
-        val w = writer ?: return
-        synchronized(w) {
-            w.write(message.encode())
-            w.write("\n")
-            w.flush()
-        }
+        controlChannel.send(message)
     }
 
     private companion object {
         const val TAG = "PartyGuestEngine"
-        const val CONNECT_TIMEOUT_MS = 5_000
 
         /** Small lead added to corrective seeks to cover the seek latency itself. */
         const val SEEK_LEAD_MS = 60L
@@ -694,10 +606,6 @@ class PartyGuestEngine(
 
         /** Speed is pinned to 1x once this close to the track's natural end — see the Sonic crash comment above. */
         const val END_OF_TRACK_SETTLE_MS = 2_000L
-
-        /** Reconnect every few seconds for ~2 minutes before giving up. */
-        const val RECONNECT_DELAY_MS = 3_000L
-        const val MAX_RECONNECT_ATTEMPTS = 40
 
         /** Player-error recovery: retries within this window count toward the cap below. */
         const val ERROR_WINDOW_MS = 10_000L
