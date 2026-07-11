@@ -6,10 +6,7 @@ import android.net.wifi.WifiManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
-import androidx.core.net.toUri
 import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
@@ -24,7 +21,6 @@ import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.model.ui.SyncQuality
 import com.jp.paperplayer.service.PlaybackService
 import java.io.BufferedWriter
-import java.io.File
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -80,9 +76,22 @@ class PartyGuestEngine(
     private var reconnectAttempts = 0
 
     private var controller: MediaController? = null
-    private var preparedSongId: Long? = null
-    private var preparedFile: File? = null
-    private var preparedSha256: String? = null
+    private val downloadCoordinator = PartyGuestDownloadCoordinator(
+        context = context,
+        scope = scope,
+        downloader = downloader,
+        send = ::send,
+        update = update,
+        getController = { controller },
+        hostAddress = { hostAddress },
+        httpPort = { httpPort },
+        cancelActiveCycles = {
+            pendingStartJob?.cancel()
+            driftJob?.cancel()
+        },
+        runClockSyncRound = { count -> clockSync.runPingRound(count) },
+        latencyTrimMs = { latencyTrimMs },
+    )
 
     // Scheduled-start bookkeeping: the party timeline the drift loop chases.
     private var pendingStartJob: Job? = null
@@ -253,8 +262,8 @@ class PartyGuestEngine(
                         return
                     }
                     is PartyMessage.Pong -> clockSync.onPong(message)
-                    is PartyMessage.Prepare -> onPrepare(message)
-                    is PartyMessage.SyncCheck -> onSyncCheck(message)
+                    is PartyMessage.Prepare -> downloadCoordinator.onPrepare(message)
+                    is PartyMessage.SyncCheck -> downloadCoordinator.onSyncCheck(message)
                     is PartyMessage.Start -> onStart(message)
                     is PartyMessage.Pause -> onPause(message)
                     is PartyMessage.Resume -> onResume(message)
@@ -291,73 +300,8 @@ class PartyGuestEngine(
 
     // ── Playback ────────────────────────────────────────────────────────────
 
-    private fun onPrepare(prepare: PartyMessage.Prepare) {
-        val host = hostAddress ?: return
-        pendingStartJob?.cancel()
-        driftJob?.cancel()
-        update {
-            it.copy(
-                isDownloading = true,
-                nowPlaying = "${prepare.title} — ${prepare.artist}",
-                startsInMs = null,
-            )
-        }
-        scope.launch {
-            try {
-                val url = "http://$host:$httpPort/song/${prepare.songId}"
-                val file = downloader.download(url, prepare.songId, prepare.ext, prepare.sizeBytes, prepare.sha256)
-                preparedSongId = prepare.songId
-                preparedFile = file
-                preparedSha256 = prepare.sha256
-                withContext(Dispatchers.Main) {
-                    val c = controller ?: return@withContext
-                    c.pause()
-                    c.setPlaybackParameters(PlaybackParameters.DEFAULT)
-                    c.setMediaItem(buildPartyMediaItem(prepare, file))
-                    c.prepare()
-                }
-                update { it.copy(isDownloading = false) }
-                send(PartyMessage.Ready(prepare.songId))
-            } catch (e: Exception) {
-                Log.w(TAG, "Prepare failed for ${prepare.songId}: ${e.message}")
-                update { it.copy(isDownloading = false, error = "Could not download ${prepare.title}") }
-            }
-        }
-    }
-
-    /**
-     * Pre-start checklist, run every time the host is about to start playback:
-     * verify the prepared file still matches the host's hash, re-measure the
-     * clock offset with a fresh ping round, park the player at the start
-     * position, then ack. A failed file check makes the host re-send the file.
-     */
-    private fun onSyncCheck(check: PartyMessage.SyncCheck) {
-        pendingStartJob?.cancel()
-        driftJob?.cancel()
-        update { it.copy(startsInMs = null) }
-        scope.launch {
-            val fileOk = check.songId == preparedSongId &&
-                preparedFile?.exists() == true &&
-                (check.sha256.isEmpty() || check.sha256 == preparedSha256)
-            if (!fileOk) {
-                Log.w(TAG, "Sync check failed for ${check.songId} — asking for the file again")
-                runCatching { send(PartyMessage.SyncReady(check.songId, false, "file missing or stale")) }
-                return@launch
-            }
-            clockSync.runPingRound(ClockSync.REFRESH_PING_COUNT)
-            withContext(Dispatchers.Main) {
-                controller?.let { c ->
-                    c.setPlaybackParameters(PlaybackParameters.DEFAULT)
-                    c.pause()
-                    c.seekTo(check.positionMs + latencyTrimMs)
-                }
-            }
-            runCatching { send(PartyMessage.SyncReady(check.songId, true, "")) }
-        }
-    }
-
     private fun onStart(start: PartyMessage.Start) {
-        if (start.songId != preparedSongId) return
+        if (start.songId != downloadCoordinator.preparedSongId) return
         schedulePlay(start.positionMs, start.atHostElapsedMs)
         update { it.copy(error = null) }
     }
@@ -581,21 +525,6 @@ class PartyGuestEngine(
         }
     }
 
-    private fun buildPartyMediaItem(prepare: PartyMessage.Prepare, file: File): MediaItem =
-        MediaItem.Builder()
-            .setUri(file.toUri())
-            // Non-numeric media id: keeps guest play counts clean and the
-            // MiniPlayer hidden (it resolves songs via mediaId.toLongOrNull()).
-            .setMediaId("party:${prepare.songId}")
-            .setMediaMetadata(
-                MediaMetadata.Builder()
-                    .setTitle(prepare.title)
-                    .setArtist(prepare.artist)
-                    .setAlbumTitle(prepare.album)
-                    .build()
-            )
-            .build()
-
     private fun connectController() {
         if (controller != null) return
         val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
@@ -647,7 +576,7 @@ class PartyGuestEngine(
         controller?.let { c ->
             ContextCompat.getMainExecutor(context).execute {
                 // Only silence playback we started; leave the host's own music alone.
-                if (preparedSongId != null) {
+                if (downloadCoordinator.preparedSongId != null) {
                     runCatching {
                         c.pause()
                         c.clearMediaItems()
@@ -658,9 +587,7 @@ class PartyGuestEngine(
             }
         }
         controller = null
-        preparedSongId = null
-        preparedFile = null
-        preparedSha256 = null
+        downloadCoordinator.clearPrepared()
     }
 
     /**
