@@ -87,6 +87,7 @@ class PartyGuestEngine(
         },
         runClockSyncRound = { count -> clockSync.runPingRound(count) },
         latencyTrimMs = { latencyTrimMs },
+        fileTransferMode = { settings.getPartyFileTransferMode() },
     )
 
     // Scheduled-start bookkeeping: the party timeline the drift loop chases.

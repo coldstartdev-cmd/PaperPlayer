@@ -12,6 +12,7 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
+import com.jp.paperplayer.data.PartyFileTransferMode
 import com.jp.paperplayer.data.PlayCountStore
 import com.jp.paperplayer.data.SettingsStore
 import com.jp.paperplayer.data.ShuffleStrategy
@@ -49,6 +50,9 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _shuffleStrategy = MutableStateFlow(settingsStore.getShuffleStrategy())
     val shuffleStrategy: StateFlow<ShuffleStrategy> = _shuffleStrategy.asStateFlow()
+
+    private val _partyFileTransferMode = MutableStateFlow(settingsStore.getPartyFileTransferMode())
+    val partyFileTransferMode: StateFlow<PartyFileTransferMode> = _partyFileTransferMode.asStateFlow()
 
     private val _playCounts = MutableStateFlow<Map<Long, Int>>(emptyMap())
     val playCounts: StateFlow<Map<Long, Int>> = _playCounts.asStateFlow()
@@ -245,6 +249,11 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
     fun setShuffleStrategy(strategy: ShuffleStrategy) {
         settingsStore.setShuffleStrategy(strategy)
         _shuffleStrategy.value = strategy
+    }
+
+    fun setPartyFileTransferMode(mode: PartyFileTransferMode) {
+        settingsStore.setPartyFileTransferMode(mode)
+        _partyFileTransferMode.value = mode
     }
 
     private fun smartShuffle(songs: List<Song>, counts: Map<Long, Int>): List<Song> {

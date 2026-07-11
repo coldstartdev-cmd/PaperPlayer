@@ -10,6 +10,14 @@ enum class ShuffleStrategy {
     RANDOM,
 }
 
+enum class PartyFileTransferMode {
+    /** Guest downloads the whole file before playing — the original, most reliable behavior. */
+    DOWNLOAD,
+
+    /** Guest plays directly from the host's HTTP URL, no local copy. */
+    STREAM,
+}
+
 class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
@@ -46,10 +54,21 @@ class SettingsStore(context: Context) {
         prefs.edit().putLong(KEY_PARTY_LATENCY_TRIM, trimMs).apply()
     }
 
+    /** How a guest gets a song's bytes before playing it; see [PartyFileTransferMode]. */
+    fun getPartyFileTransferMode(): PartyFileTransferMode =
+        prefs.getString(KEY_PARTY_FILE_TRANSFER_MODE, null)
+            ?.let { runCatching { PartyFileTransferMode.valueOf(it) }.getOrNull() }
+            ?: PartyFileTransferMode.DOWNLOAD
+
+    fun setPartyFileTransferMode(mode: PartyFileTransferMode) {
+        prefs.edit().putString(KEY_PARTY_FILE_TRANSFER_MODE, mode.name).apply()
+    }
+
     private companion object {
         const val KEY_SHUFFLE_STRATEGY = "shuffle_strategy"
         const val KEY_EXCLUDED_FOLDERS = "excluded_folders"
         const val KEY_PARTY_DEVICE_NAME = "party_device_name"
         const val KEY_PARTY_LATENCY_TRIM = "party_latency_trim"
+        const val KEY_PARTY_FILE_TRANSFER_MODE = "party_file_transfer_mode"
     }
 }
