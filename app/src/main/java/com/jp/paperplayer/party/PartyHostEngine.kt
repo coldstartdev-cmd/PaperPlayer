@@ -18,15 +18,10 @@ import com.jp.paperplayer.model.data.PartyMemberStatus
 import com.jp.paperplayer.model.ui.PartyRole
 import com.jp.paperplayer.model.ui.PartyUiState
 import com.jp.paperplayer.service.PlaybackService
-import java.io.BufferedReader
-import java.io.BufferedWriter
 import java.net.InetSocketAddress
 import java.net.ServerSocket
-import java.net.Socket
-import java.util.UUID
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -67,10 +62,17 @@ class PartyHostEngine(
     private var serverSocket: ServerSocket? = null
     private var udpLocalPort = 0
     private val udpChannel = PartyHostUdpChannel { memberId, stats, receivedAtHostMs ->
-        val client = synchronized(clients) { clients[memberId] } ?: return@PartyHostUdpChannel
+        val client = controlServer.get(memberId) ?: return@PartyHostUdpChannel
         onSyncStats(client, stats, receivedAtHostMs)
     }
-    private val clients = mutableMapOf<String, ClientConnection>()
+    private val controlServer = PartyHostControlServer(
+        onHello = ::onHello,
+        onReady = ::onGuestReady,
+        onSyncReady = ::onSyncReady,
+        onCalibrateRequest = { client, bandIndex -> calibrationCoordinator.onCalibrateRequest(client.memberId, bandIndex) },
+        onCalibrateComplete = { client, bandIndex -> calibrationCoordinator.onCalibrateComplete(client.memberId, bandIndex) },
+        onClientGone = ::onClientGone,
+    )
     private val rosterStatus = PartyHostRosterStatus()
     private val syncStatsTracker = PartyHostSyncStatsTracker(
         timeline = object : HostTimelineSnapshot {
@@ -130,19 +132,12 @@ class PartyHostEngine(
 
     @Volatile
     private var currentSongId: Long? = null
-    private var awaitingReady = mutableSetOf<String>()
     private val calibrationCoordinator = PartyHostCalibrationCoordinator(
         context = context,
         scope = scope,
         pauseHostPlayback = { if (controller?.playWhenReady == true) controller?.pause() },
-        sendToClient = ::sendToClient,
+        sendToClient = controlServer::sendTo,
     )
-
-    // Out-of-band per-client SYNC_CHECK rounds (auto-resync watchdog), keyed
-    // by memberId — distinct from the party-wide awaitingReady/checklist
-    // cycle since these target one straggling guest without disturbing
-    // anyone else.
-    private val singleClientSyncAcks = mutableMapOf<String, CompletableDeferred<Boolean>>()
 
     private val resyncWatchdog = PartyHostResyncWatchdog(
         scope = scope,
@@ -155,32 +150,11 @@ class PartyHostEngine(
                 if (controller?.playWhenReady == true) controller?.currentPosition else null
             }
         },
-        sendToClient = ::sendToClient,
+        sendToClient = controlServer::sendTo,
         isPreparing = { preparing },
-        registerSyncAck = { memberId ->
-            val ack = CompletableDeferred<Boolean>()
-            synchronized(clients) { singleClientSyncAcks[memberId] = ack }
-            ack
-        },
-        clearSyncAck = { memberId -> synchronized(clients) { singleClientSyncAcks.remove(memberId) } },
+        registerSyncAck = controlServer::registerSyncAck,
+        clearSyncAck = { memberId -> controlServer.takeSyncAck(memberId) },
     )
-
-    private class ClientConnection(
-        val memberId: String,
-        val socket: Socket,
-        val reader: BufferedReader,
-        val writer: BufferedWriter,
-    ) {
-        var deviceName: String = "Unknown device"
-
-        fun send(message: PartyMessage) {
-            synchronized(writer) {
-                writer.write(message.encode())
-                writer.write("\n")
-                writer.flush()
-            }
-        }
-    }
 
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -251,21 +225,21 @@ class PartyHostEngine(
         update {
             it.copy(role = PartyRole.HOST, partyName = partyName, members = emptyList(), error = null)
         }
-        scope.launch { acceptLoop(server) }
+        controlServer.start(server, scope)
         udpLocalPort = udpChannel.start(scope)
     }
 
     /** Assigns [role] to one guest for the bass/mid/treble party trick; NONE turns it off. */
     fun setGuestEqRole(memberId: String, role: PartyEqRole) {
-        val client = synchronized(clients) { clients[memberId] } ?: return
+        controlServer.get(memberId) ?: return
         rosterStatus.setEqRole(memberId, role)
-        runCatching { client.send(PartyMessage.SetEqRole(role)) }
+        controlServer.sendTo(memberId, PartyMessage.SetEqRole(role))
         publishMembers()
     }
 
     fun stop() {
         if (wifiLock.isHeld) wifiLock.release()
-        val snapshot = synchronized(clients) { clients.values.toList().also { clients.clear() } }
+        val snapshot = controlServer.snapshotAndClear()
         rosterStatus.clear()
         udpChannel.clearEndpoints()
         PartyEqController.setRole(PartyEqRole.NONE)
@@ -294,80 +268,40 @@ class PartyHostEngine(
 
     // ── Control channel ─────────────────────────────────────────────────────
 
-    private fun acceptLoop(server: ServerSocket) {
-        while (!server.isClosed) {
-            val socket = try {
-                server.accept()
-            } catch (e: Exception) {
-                break
-            }
-            scope.launch { handleClient(socket) }
-        }
+    /**
+     * A guest just completed HELLO/version-check and was added to
+     * [controlServer]'s roster — mark it syncing, register where its UDP
+     * datagrams will come from, welcome it, and if a song is already loaded
+     * mid-party, ship it over.
+     */
+    private fun onHello(client: ClientConnection, hello: PartyMessage.Hello) {
+        rosterStatus.setStatus(client.memberId, PartyMemberStatus.SYNCING)
+        // The guest's own outgoing UDP socket is bound to hello.udpPort, so
+        // datagrams from it arrive from (its IP, that port) — the same pair
+        // we can build right now from the already-connected TCP socket plus
+        // what it told us.
+        udpChannel.registerEndpoint(client.memberId, InetSocketAddress(client.socket.inetAddress, hello.udpPort))
+        client.send(
+            PartyMessage.Welcome(
+                protocolVersion = PartyProtocol.VERSION,
+                partyName = partyName,
+                hostName = hostDeviceName,
+                httpPort = fileServer.listeningPort,
+                memberId = client.memberId,
+                udpPort = udpLocalPort,
+            )
+        )
+        publishMembers()
+        sendCurrentSongTo(client)
     }
 
-    private fun handleClient(socket: Socket) {
-        val memberId = UUID.randomUUID().toString()
-        val client = ClientConnection(
-            memberId = memberId,
-            socket = socket,
-            reader = socket.getInputStream().bufferedReader(),
-            writer = socket.getOutputStream().bufferedWriter(),
-        )
-        try {
-            val hello = PartyMessage.parse(client.reader.readLine() ?: return) as? PartyMessage.Hello
-                ?: return
-            if (hello.protocolVersion != PartyProtocol.VERSION) {
-                client.send(PartyMessage.Error("Incompatible app version — update PaperPlayer on both devices"))
-                return
-            }
-            client.deviceName = hello.deviceName
-            synchronized(clients) { clients[memberId] = client }
-            rosterStatus.setStatus(memberId, PartyMemberStatus.SYNCING)
-            // The guest's own outgoing UDP socket is bound to hello.udpPort,
-            // so datagrams from it arrive from (its IP, that port) — the same
-            // pair we can build right now from the already-connected TCP
-            // socket plus what it told us.
-            udpChannel.registerEndpoint(memberId, InetSocketAddress(socket.inetAddress, hello.udpPort))
-            client.send(
-                PartyMessage.Welcome(
-                    protocolVersion = PartyProtocol.VERSION,
-                    partyName = partyName,
-                    hostName = hostDeviceName,
-                    httpPort = fileServer.listeningPort,
-                    memberId = memberId,
-                    udpPort = udpLocalPort,
-                )
-            )
-            publishMembers()
-            sendCurrentSongTo(client)
-
-            while (true) {
-                val line = client.reader.readLine() ?: break
-                when (val message = PartyMessage.parse(line)) {
-                    is PartyMessage.Ping -> client.send(
-                        PartyMessage.Pong(message.seq, message.t0, SystemClock.elapsedRealtime())
-                    )
-                    is PartyMessage.Ready -> onGuestReady(client, message.songId)
-                    is PartyMessage.SyncReady -> onSyncReady(client, message)
-                    is PartyMessage.CalibrateRequest -> calibrationCoordinator.onCalibrateRequest(client.memberId, message.bandIndex)
-                    is PartyMessage.CalibrateComplete -> calibrationCoordinator.onCalibrateComplete(client.memberId, message.bandIndex)
-                    is PartyMessage.Bye -> break
-                    else -> {}
-                }
-            }
-        } catch (e: Exception) {
-            Log.d(TAG, "Client $memberId dropped: ${e.message}")
-        } finally {
-            synchronized(clients) { clients.remove(memberId) }
-            rosterStatus.remove(memberId)
-            syncStatsTracker.remove(memberId)
-            synchronized(clients) { awaitingReady.remove(memberId) }
-            synchronized(clients) { singleClientSyncAcks.remove(memberId)?.complete(false) }
-            resyncWatchdog.remove(memberId)
-            udpChannel.removeEndpoint(memberId)
-            runCatching { socket.close() }
-            publishMembers()
-        }
+    /** A guest's TCP connection ended — [controlServer] already dropped its own roster entries. */
+    private fun onClientGone(memberId: String) {
+        rosterStatus.remove(memberId)
+        syncStatsTracker.remove(memberId)
+        resyncWatchdog.remove(memberId)
+        udpChannel.removeEndpoint(memberId)
+        publishMembers()
     }
 
     /** Late joiner while a song is already loaded: ship them the current track. */
@@ -397,7 +331,7 @@ class PartyHostEngine(
         // A stray, single-client SYNC_CHECK round (auto-resync watchdog) —
         // resolve it separately from the party-wide checklist below so it
         // doesn't touch awaitingReady or get mistaken for that cycle's ack.
-        val strayAck = synchronized(clients) { singleClientSyncAcks.remove(client.memberId) }
+        val strayAck = controlServer.takeSyncAck(client.memberId)
         if (strayAck != null) {
             if (message.ok) {
                 setStatus(client.memberId, PartyMemberStatus.READY)
@@ -410,7 +344,7 @@ class PartyHostEngine(
         }
         if (message.ok) {
             setStatus(client.memberId, PartyMemberStatus.READY)
-            synchronized(clients) { awaitingReady.remove(client.memberId) }
+            controlServer.removeAwaiting(client.memberId)
         } else {
             Log.w(TAG, "${client.deviceName} failed sync check (${message.reason}); re-sending file")
             resendFile(client, message.songId)
@@ -429,10 +363,8 @@ class PartyHostEngine(
     private fun onGuestReady(client: ClientConnection, songId: Long) {
         if (songId != currentSongId) return
         setStatus(client.memberId, PartyMemberStatus.READY)
-        val stillPreparing = synchronized(clients) {
-            awaitingReady.remove(client.memberId)
-            preparing
-        }
+        controlServer.removeAwaiting(client.memberId)
+        val stillPreparing = preparing
         if (!stillPreparing) {
             // Mid-song late joiner: start them where the host will be at the
             // scheduled instant (the host keeps playing, so lead-compensate).
@@ -487,7 +419,7 @@ class PartyHostEngine(
                 return@launch
             }
             val sha256 = songCatalog.sha256(song)
-            synchronized(clients) { awaitingReady = clients.keys.toMutableSet() }
+            controlServer.resetAwaitingToAllClients()
             setAllStatuses(PartyMemberStatus.DOWNLOADING)
             broadcast(songCatalog.prepareMessage(song, sha256))
             awaitReadySet(READY_TIMEOUT_MS)
@@ -569,7 +501,7 @@ class PartyHostEngine(
      * host included — starts at the same host-clock instant.
      */
     private suspend fun runStartChecklist(songId: Long, sha256: String, positionMs: Long, leadMs: Long) {
-        synchronized(clients) { awaitingReady = clients.keys.toMutableSet() }
+        controlServer.resetAwaitingToAllClients()
         setAllStatuses(PartyMemberStatus.SYNCING)
         broadcast(PartyMessage.SyncCheck(songId, sha256, positionMs))
         awaitReadySet(SYNC_CHECK_TIMEOUT_MS)
@@ -577,7 +509,7 @@ class PartyHostEngine(
         Log.i(TAG, "Scheduled start: song $songId at ${positionMs}ms in ${leadMs}ms (host clock $startAt)")
         broadcast(PartyMessage.Start(songId, positionMs, startAt))
         syncStatsTracker.clearAll()
-        resyncWatchdog.markStartedForAll(synchronized(clients) { clients.keys.toList() })
+        resyncWatchdog.markStartedForAll(controlServer.clientIds())
         setAllStatuses(PartyMemberStatus.PLAYING)
         hostPlayAt(startAt, positionMs)
     }
@@ -585,7 +517,7 @@ class PartyHostEngine(
     private suspend fun awaitReadySet(timeoutMs: Long) {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (SystemClock.elapsedRealtime() < deadline) {
-            if (synchronized(clients) { awaitingReady.isEmpty() }) break
+            if (controlServer.isAwaitingEmpty()) break
             delay(200L)
         }
     }
@@ -692,21 +624,14 @@ class PartyHostEngine(
 
     // ── Roster & broadcast helpers ──────────────────────────────────────────
 
-    private fun hasGuests(): Boolean = synchronized(clients) { clients.isNotEmpty() }
+    private fun hasGuests(): Boolean = controlServer.hasGuests()
 
     private fun broadcast(message: PartyMessage) {
-        val snapshot = synchronized(clients) { clients.values.toList() }
-        snapshot.forEach { client -> runCatching { client.send(message) } }
+        controlServer.broadcast(message)
     }
 
     private fun broadcastAsync(message: PartyMessage) {
         scope.launch { broadcast(message) }
-    }
-
-    /** Sends to one specific guest by id, swallowing a failure the same way [broadcast] does. */
-    private fun sendToClient(memberId: String, message: PartyMessage) {
-        val client = synchronized(clients) { clients[memberId] } ?: return
-        runCatching { client.send(message) }
     }
 
     private fun setStatus(memberId: String, status: PartyMemberStatus) {
@@ -720,16 +645,14 @@ class PartyHostEngine(
     }
 
     private fun publishMembers() {
-        val members = synchronized(clients) {
-            clients.values.map { client ->
-                PartyMember(
-                    id = client.memberId,
-                    name = client.deviceName,
-                    status = rosterStatus.status(client.memberId),
-                    stats = syncStatsTracker.snapshot(client.memberId),
-                    eqRole = rosterStatus.eqRole(client.memberId),
-                )
-            }
+        val members = controlServer.snapshot().map { client ->
+            PartyMember(
+                id = client.memberId,
+                name = client.deviceName,
+                status = rosterStatus.status(client.memberId),
+                stats = syncStatsTracker.snapshot(client.memberId),
+                eqRole = rosterStatus.eqRole(client.memberId),
+            )
         }
         update { it.copy(members = members) }
     }
