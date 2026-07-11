@@ -40,7 +40,7 @@ internal class ClientConnection(
  * the two protocol-level messages that are pure socket mechanics: PING
  * (self-contained echo) and BYE (ends the loop).
  */
-class PartyHostControlServer(
+internal class PartyHostControlServer(
     private val onHello: (client: ClientConnection, hello: PartyMessage.Hello) -> Unit,
     private val onReady: (client: ClientConnection, songId: Long) -> Unit,
     private val onSyncReady: (client: ClientConnection, message: PartyMessage.SyncReady) -> Unit,
